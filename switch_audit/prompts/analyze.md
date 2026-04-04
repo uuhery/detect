@@ -24,7 +24,10 @@ A Fact must:
 > Fact 1: "HTTP server is enabled on port 80 with no IPv4 access class restriction."
 > Fact 2: "HTTP server authentication method is configured as 'enable' password."
 
-Only extract facts with **security relevance**. Skip purely informational output (e.g., uptime, memory size).
+Only extract facts with **security relevance**. Skip purely informational output (e.g., uptime, memory size, configuration register value, boot image path).
+
+A Fact **must** have a real `raw_evidence` line quoted verbatim from the command output.
+Do **not** invent or infer Facts for commands that have not been executed yet — no output means no Fact.
 
 ---
 
@@ -65,13 +68,45 @@ If your analysis does not increase confidence, keep the existing level — do no
 
 ---
 
-## Rule 5: SSH Error Handling
+## Rule 5: Error Output Handling
 
-If `command_status` is `ssh_error`:
-- The output text is an error message, not device data.
-- Extract a Fact **only** if the error itself is security-relevant
-  (e.g., "Connection refused for 'show port-security' may indicate the feature is disabled globally").
-- Otherwise, output `"new_facts": []` and `"chain_updates": []`.
+If `command_status` is `ssh_error`, **or** if the output begins with a Cisco IOS error prefix
+(`%` — e.g., `% Incomplete command.`, `% Invalid input detected`, `% Ambiguous command`):
+
+- The output is execution metadata, not device security data.
+- Do **not** extract any Fact from it.
+- Do **not** create an AttackChain whose only basis is the error message itself.
+- Output `"new_facts": []` and `"chain_updates": []` for this command.
+
+Exception: if `command_status` is `ssh_error` and the error text suggests a service is definitively
+absent (e.g., "Connection refused" for a management port), you may extract one Fact if it has
+clear security significance (e.g., "SSH is not listening on port 22").
+
+---
+
+## Rule 6: Prospective Speculative Chains
+
+After processing the current command's Facts, review the **"Uncovered reconnaissance areas"**
+section in the user message. For each uncovered area that could **combine with at least one
+already-confirmed Fact** to form a high-severity attack path, you MAY create a speculative
+AttackChain hypothesis.
+
+**Hard constraints — all must hold:**
+
+1. `fact_ids` must include **≥1 real Fact ID** that already exists in "Existing Facts".
+   The chain must be anchored to confirmed evidence, not invented from thin air.
+2. The uncovered command's potential contribution is described **only in `attack_narrative`**,
+   never as a fake Fact ID. Write it as a conditional:
+   `"IF [uncovered command] reveals [condition], THEN attacker can..."`.
+3. `confidence` must be `speculative` — never `likely` or `confirmed` for a prospective chain.
+4. `verification_needed` must contain **exactly the uncovered command(s)** that would confirm
+   or refute the chain. Use exact IOS XE syntax.
+5. Create at most **2 prospective chains per trial** — prioritise highest severity combinations.
+
+**When NOT to create a prospective chain:**
+- The uncovered area has no plausible connection to any existing confirmed Fact.
+- An equivalent chain already exists in "Existing AttackChains" (even if speculative).
+- You have fewer than 2 confirmed Facts to anchor the hypothesis.
 
 ---
 

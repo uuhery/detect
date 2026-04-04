@@ -325,7 +325,21 @@ def _build_analyze_context(state: AuditState) -> str:
         f"  New Chain IDs (only when existing_chain_id=null) must use prefix: c{current_trial}-"
     )
 
-    return "\n\n".join([latest_section, facts_section, chains_section, id_hint])
+    # 段五：未覆盖的侦察方向（供 Rule 6 推断 speculative chain 使用）
+    # 只传命令名，不传输出——这些命令尚未执行，LLM 只能推断可能的关联，不能编造 Fact
+    executed_set = set(state.get("executed_commands", []))
+    uncovered = [c for c in _RECON_CHECKLIST if c not in executed_set]
+    if uncovered:
+        uncovered_section = (
+            "## Uncovered reconnaissance areas (not yet executed)\n"
+            "These commands have NOT been run yet. You may use them as anchors for speculative\n"
+            "chain hypotheses (Rule 6), but do NOT extract Facts from them — no output exists.\n"
+            + "\n".join(f"  - {c}" for c in uncovered)
+        )
+    else:
+        uncovered_section = "## Uncovered reconnaissance areas\n  (all checklist commands have been executed)"
+
+    return "\n\n".join([latest_section, facts_section, chains_section, id_hint, uncovered_section])
 
 
 def _parse_analyze_response(raw: str, current_trial: int) -> tuple[list, list, str]:
