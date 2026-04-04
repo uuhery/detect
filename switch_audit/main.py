@@ -11,6 +11,7 @@ For LangSmith tracing, set in .env:
 
 import argparse
 import uuid
+from datetime import datetime, timezone
 
 from switch_audit.core.config import settings
 from switch_audit.core.langgraph.graph import build_graph
@@ -31,12 +32,26 @@ def run_audit(target: str, session_id: str | None = None) -> None:
     graph = build_graph()
 
     initial_state = {
+        # LangGraph managed
         "messages": [],
+        # 会话标识
         "session_id": session_id,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        # 目标设备
         "target": target,
-        "hypothesis": "",
-        "observations": [],
+        "device_os": "",           # analyze 节点从 show version 填充
+        # 执行日志
+        "command_history": [],
         "executed_commands": [],
+        # 分析产物（Iter 2 的 analyze 节点填充，此处初始化为空）
+        "facts": [],
+        "attack_chains": [],
+        # 调查引导（Iter 2 后由 analyze 节点维护）
+        "next_probes": [],
+        # think 节点产物
+        "reasoning": "",
+        "proposed_command": "",
+        # 控制
         "trial_count": 0,
         "status": "running",
     }
