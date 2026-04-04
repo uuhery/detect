@@ -11,6 +11,7 @@
 import json
 import logging
 import re
+from typing import Final
 
 from langchain_openai import ChatOpenAI
 
@@ -31,23 +32,61 @@ _llm = ChatOpenAI(
     base_url=settings.OPENAI_BASE_URL,
 )
 
+# Iter 0：临时侦察清单，用于告知 LLM 还有哪些方向未覆盖。
+# 注意：这是脚手架，Iter 3（动态规划节点）落地后会删除。
+_RECON_CHECKLIST: Final[list[str]] = [
+    "show version",
+    "show running-config",
+    "show ip interface brief",
+    "show mac address-table",
+    "show vlan",
+    "show spanning-tree",
+    "show spanning-tree detail",
+    "show ip ssh",
+    "show line vty 0 4",
+    "show users",
+    "show privilege",
+    "show cdp neighbors",
+    "show interfaces trunk",
+    "show port-security",
+    "show ip http server status",
+]
+
 
 def think(state: AuditState) -> dict:
     """通过查询 LLM 生成下一个审计假设。"""
+    executed: list[str] = state.get("executed_commands", [])
+    remaining = [c for c in _RECON_CHECKLIST if c not in executed]
+
     logger.info(
         "node.think",
         trial=state["trial_count"],
         target=state["target"],
-        previous_hypothesis=state["hypothesis"] or "<none>",
+        executed_count=len(executed),
+        remaining_count=len(remaining),
+    )
+
+    # 结构化的上下文：明确区分"已执行"和"待检查"
+    executed_section = (
+        "\n".join(f"  - {c}" for c in executed) if executed else "  (none yet)"
+    )
+    remaining_section = (
+        "\n".join(f"  - {c}" for c in remaining) if remaining else "  (all covered)"
+    )
+    observations_section = (
+        "\n\n".join(state["observations"]) if state["observations"] else "(none yet)"
     )
 
     user_msg = (
         f"Target device: {state['target']}\n"
-        f"Trial: {state['trial_count']}\n"
-        f"Previous hypothesis: {state['hypothesis'] or 'none'}\n"
-        f"Observations so far:\n"
-        + ("\n".join(f"  - {o}" for o in state["observations"]) or "  (none yet)")
-        + "\n\nGenerate the next hypothesis."
+        f"Trial: {state['trial_count']}\n\n"
+        f"## Commands already executed — DO NOT propose any of these again:\n"
+        f"{executed_section}\n\n"
+        f"## Suggested next directions (prefer these, but you may propose others):\n"
+        f"{remaining_section}\n\n"
+        f"## Observations so far:\n"
+        f"{observations_section}\n\n"
+        f"Generate the next hypothesis."
     )
 
     response = _llm.invoke([
@@ -75,12 +114,27 @@ def _extract_proposed_action(hypothesis_raw: str) -> str:
 def act(state: AuditState) -> dict:
     """通过 SSH 在目标设备上执行 LLM 建议的探测命令。"""
     command = _extract_proposed_action(state["hypothesis"])
+    executed: list[str] = state.get("executed_commands", [])
+
     logger.info(
         "node.act",
         command=command,
         trial=state["trial_count"],
         target=state["target"],
     )
+
+    # 程序级去重：即使模型违反约束，也不会空转浪费 SSH 配额
+    if command in executed:
+        logger.warning("node.act.duplicate_skipped", command=command)
+        observation = (
+            f"[trial={state['trial_count']}] [SKIPPED: duplicate] $ {command}\n"
+            f"(This command was already executed. Choose a different investigation direction.)"
+        )
+        return {
+            "observations": state["observations"] + [observation],
+            "executed_commands": executed,
+            "trial_count": state["trial_count"] + 1,
+        }
 
     output = ssh_exec(
         host=state["target"],
@@ -96,5 +150,6 @@ def act(state: AuditState) -> dict:
     observation = f"[trial={state['trial_count']}] $ {command}\n{output}"
     return {
         "observations": state["observations"] + [observation],
+        "executed_commands": executed + [command],
         "trial_count": state["trial_count"] + 1,
     }

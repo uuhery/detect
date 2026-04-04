@@ -24,9 +24,11 @@ class AuditState(TypedDict):
     # ── 审计循环 ─────────────────────────────────────────────────────
     # 当前正在测试的假设（由 think 节点生成）
     hypothesis: str
-    # 从设备累积的观察结果（由 observe 节点追加）
+    # 从设备累积的观察结果（由 act 节点追加）
     observations: list[str]
-    # 已完成的 think → act → observe 循环次数
+    # 已执行过的命令列表（去重用，由 act 节点追加）
+    executed_commands: list[str]
+    # 已完成的 think → act 循环次数
     trial_count: int
     # "running" | "completed" | "error"
     status: str

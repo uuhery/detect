@@ -36,6 +36,7 @@ def run_audit(target: str, session_id: str | None = None) -> None:
         "target": target,
         "hypothesis": "",
         "observations": [],
+        "executed_commands": [],
         "trial_count": 0,
         "status": "running",
     }
