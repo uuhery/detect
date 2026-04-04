@@ -5,15 +5,24 @@
 
 当前节点：
   思考 — 调用 LLM 生成下一个审计假设
-  行动 — 占位符：将原子探测派遣到设备
+  行动 — 通过 SSH 在目标设备上执行探测命令
 """
 
+import json
+import logging
+import re
+
 from langchain_openai import ChatOpenAI
+
+# 抑制 netmiko / paramiko 的 read_channel 调试噪音
+logging.getLogger("netmiko").setLevel(logging.WARNING)
+logging.getLogger("paramiko").setLevel(logging.WARNING)
 
 from switch_audit.core.config import settings
 from switch_audit.core.langgraph.state import AuditState
 from switch_audit.core.logging import logger
 from switch_audit.prompts import load_system_prompt
+from switch_audit.tools import ssh_exec
 
 _llm = ChatOpenAI(
     model=settings.DEFAULT_LLM_MODEL,
@@ -51,15 +60,40 @@ def think(state: AuditState) -> dict:
     return {"hypothesis": hypothesis}
 
 
+def _extract_proposed_action(hypothesis_raw: str) -> str:
+    """从 LLM 输出中提取 proposed_action 字段（兼容 markdown 代码块）。"""
+    # 去掉可能的 markdown ```json ... ``` 包裹
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", hypothesis_raw, re.DOTALL)
+    text = match.group(1) if match else hypothesis_raw
+    try:
+        return json.loads(text).get("proposed_action", "id")
+    except (json.JSONDecodeError, AttributeError):
+        # 解析失败时退回到最安全的只读命令
+        return "id"
+
+
 def act(state: AuditState) -> dict:
-    """执行当前假设隐含的原子探测。"""
+    """通过 SSH 在目标设备上执行 LLM 建议的探测命令。"""
+    command = _extract_proposed_action(state["hypothesis"])
     logger.info(
         "node.act",
-        hypothesis=state["hypothesis"],
+        command=command,
         trial=state["trial_count"],
+        target=state["target"],
     )
-    # TODO: 替换为真实的工具调用 — send_raw_packet / read_device_state
-    observation = f"placeholder_observation_for_{state['hypothesis']}"
+
+    output = ssh_exec(
+        host=state["target"],
+        port=settings.SSH_PORT,
+        username=settings.SSH_USERNAME,
+        password=settings.SSH_PASSWORD,
+        command=command,
+        timeout=settings.SSH_TIMEOUT,
+        device_type=settings.SSH_DEVICE_TYPE,
+    )
+
+    logger.info("node.act.result", output=output[:200])
+    observation = f"[trial={state['trial_count']}] $ {command}\n{output}"
     return {
         "observations": state["observations"] + [observation],
         "trial_count": state["trial_count"] + 1,

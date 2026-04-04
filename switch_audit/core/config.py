@@ -64,6 +64,14 @@ class Settings:
         self.LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY", "")
         self.LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT", self.PROJECT_NAME)
 
+        # SSH — target device credentials
+        self.SSH_PORT = int(os.getenv("SSH_PORT", "22"))
+        self.SSH_USERNAME = os.getenv("SSH_USERNAME", "admin")
+        self.SSH_PASSWORD = os.getenv("SSH_PASSWORD", "admin")
+        self.SSH_TIMEOUT = int(os.getenv("SSH_TIMEOUT", "30"))
+        # netmiko device_type: cisco_xe | cisco_ios | cisco_nxos | ...
+        self.SSH_DEVICE_TYPE = os.getenv("SSH_DEVICE_TYPE", "cisco_xe")
+
         # Logging
         self.LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
