@@ -63,7 +63,9 @@ def run_audit(target: str, session_id: str | None = None) -> None:
         "audit.complete",
         session_id=session_id,
         trials=result["trial_count"],
-        observations=len(result["observations"]),
+        commands_executed=len(result["command_history"]),
+        facts_found=len(result["facts"]),
+        chains_found=len(result["attack_chains"]),
         status=result["status"],
     )
 
@@ -74,7 +76,7 @@ def run_audit(target: str, session_id: str | None = None) -> None:
             "checkpoint",
             step=state_snapshot.metadata.get("step"),
             trial_count=state_snapshot.values.get("trial_count"),
-            hypothesis=state_snapshot.values.get("hypothesis"),
+            reasoning_preview=state_snapshot.values.get("reasoning", "")[:80],
         )
 
 
