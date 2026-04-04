@@ -1,20 +1,19 @@
-"""LangGraph audit workflow.
+"""LangGraph审计工作流程。
 
-Graph topology (placeholder):
+图拓扑（占位符）：
 
-    [START]
-       │
-    think  ──── generates hypothesis
-       │
-     act   ──── dispatches probe, records observation
-       │
-    should_continue?
-       ├── "think"  (loop back)
-       └── END
+[开始]
+   │
+思考 ──── 生成假设
+   │
+行动 ──── 派遣探测，记录观察
+   │
+是否继续？
+   ├── "思考"（循环返回）
+   └── 结束
 
-The MemorySaver checkpointer means every state transition is persisted
-in memory and can be time-travelled with graph.get_state() / graph.update_state().
-Swap MemorySaver for AsyncPostgresSaver when you need durable storage.
+内存检查点意味着每个状态转换都会在内存中持久化，并且可以通过 graph.get_state() / graph.update_state() 进行时间旅行。
+当需要持久化存储时，将 MemorySaver 替换为 AsyncPostgresSaver。
 """
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -25,12 +24,12 @@ from switch_audit.core.langgraph.nodes import act, think
 from switch_audit.core.langgraph.state import AuditState
 from switch_audit.core.logging import logger
 
-# Maximum trials per session (safety limit during early experiments)
-_MAX_TRIALS = 10
+# 每个会话的最大试验次数（早期实验的安全限制）
+_MAX_TRIALS = 2
 
 
 def _should_continue(state: AuditState) -> str:
-    """Routing function: decide whether to keep probing or stop."""
+    """路由函数：决定是否继续探测或停止。"""
     if state["status"] != "running":
         return END
     if state["trial_count"] >= _MAX_TRIALS:
@@ -40,7 +39,7 @@ def _should_continue(state: AuditState) -> str:
 
 
 def build_graph() -> CompiledStateGraph:
-    """Construct and compile the audit graph with an in-memory checkpointer."""
+    """构建并编译具有内存检查点的审计图。"""
     builder = StateGraph(AuditState)
 
     builder.add_node("think", think)
