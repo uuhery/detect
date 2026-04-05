@@ -62,13 +62,15 @@ def _should_continue(state: AuditState) -> str:
 
     决策优先级（从高到低）：
     1. 终止条件（status / trial_count）
-    2. 重规划条件（新增 confirmed chain）
+    2. 重规划条件（新增 confirmed chain AND next_probes 已耗尽）
     3. 继续探测
 
-    重规划触发条件的可解释性：
+    重规划触发条件：
     - confirmed_count 存入 state（_plan_confirmed_count），在 plan() 执行后记录快照
-    - 路由函数对比当前 confirmed_count 与快照，发现增量则触发 plan
-    - 这避免了"每轮都重规划"（浪费 API）和"永远不重规划"（plan 失去 Refiner 作用）
+    - 路由函数对比当前 confirmed_count 与快照，发现增量时：
+        - next_probes 非空 → 继续 think（让 DFS 深挖先完成，不打断链式验证）
+        - next_probes 空   → 触发 plan 重规划（此时才有意义探索新攻击面）
+    - 这避免了 plan 重规划打断 analyze→next_probes→think 的链式深挖回路。
 
     注意：_plan_confirmed_count 字段由 plan() 写入，初始值 -1（确保 trial=0 时不误触发）。
     """
@@ -83,11 +85,24 @@ def _should_continue(state: AuditState) -> str:
     snapshot = state.get("_plan_confirmed_count", -1)
 
     if current_confirmed > snapshot:
-        # 有新的 confirmed 链产生 → 触发重规划
+        # 有新的 confirmed 链，但先看 next_probes 是否还有待验证命令
+        next_probes = state.get("next_probes", [])
+        if next_probes:
+            # next_probes 非空：链式深挖尚未完成，继续让 think 执行验证命令
+            # plan 重规划延迟到 next_probes 耗尽后再触发
+            logger.info(
+                "audit.replan_deferred",
+                confirmed_now=current_confirmed,
+                confirmed_at_last_plan=snapshot,
+                pending_probes=len(next_probes),
+            )
+            return "think"
+        # next_probes 空：所有已知 speculative/likely 链已验证完毕，重规划有意义
         logger.info(
             "audit.replan_triggered",
             confirmed_now=current_confirmed,
             confirmed_at_last_plan=snapshot,
+            reason="next_probes_exhausted",
         )
         return "plan"
 

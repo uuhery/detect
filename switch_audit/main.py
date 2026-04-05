@@ -46,6 +46,8 @@ def run_audit(target: str, session_id: str | None = None) -> None:
         # 分析产物（Iter 2 的 analyze 节点填充，此处初始化为空）
         "facts": [],
         "attack_chains": [],
+        # 命令候选集（Iter 3 的 analyze 节点从 running-config 派生）
+        "available_commands": [],
         # 调查方向（Iter 3 的 plan 节点填充）
         "directions": [],
         # 调查引导（Iter 2 后由 analyze 节点维护）

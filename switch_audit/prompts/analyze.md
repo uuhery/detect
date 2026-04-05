@@ -58,6 +58,15 @@ A valid AttackChain:
 
 Do **not** create an AttackChain for a single isolated fact — that is just a finding, not a chain.
 
+**Confidence hard constraint (enforced regardless of how convincing the evidence seems):**
+- If `fact_ids` contains only **1 entry**, confidence MUST be `speculative`. No exceptions.
+- If all `fact_ids` come from the **same `source_command`**, confidence MUST be `speculative` or `likely` — never `confirmed`.
+- `confirmed` requires facts from **≥2 different commands** that together directly prove the full attack path.
+
+This means a chain like "Trunk with Default Native VLAN → VLAN Hopping" anchored only on `show running-config`
+output is at best `speculative`: the trunk may not actually be active, native VLAN may be overridden elsewhere.
+The chain becomes `likely` or `confirmed` only after `show interfaces trunk` confirms the native VLAN is 1 in the live state.
+
 ---
 
 ## Rule 3: Confidence Definitions (use strictly)
@@ -68,9 +77,13 @@ Do **not** create an AttackChain for a single isolated fact — that is just a f
 | `likely` | Most facts are confirmed; one is inferred from strong indirect evidence. |
 | `speculative` | One or more facts are assumed but not yet verified by a command. |
 
-- If `confidence` is `speculative` or `likely`, `verification_needed` **MUST** contain the exact IOS XE
-  `show` commands needed to raise confidence to `confirmed`.
+- If `confidence` is `speculative` or `likely`, `verification_needed` **MUST** contain `show` commands
+  needed to raise confidence to `confirmed`.
 - If `confidence` is `confirmed`, `verification_needed` **MUST** be an empty list `[]`.
+- **When the user message contains an "Available Commands" section, `verification_needed` MUST only
+  contain commands from that list.** Do NOT invent command strings. The list is syntax-verified from
+  the device's own running-config. Picking from it guarantees the command will execute without error.
+- If the "Available Commands" section is absent or empty, use standard IOS XE `show` command syntax.
 
 ---
 
@@ -118,7 +131,8 @@ AttackChain hypothesis.
    `"IF [uncovered command] reveals [condition], THEN attacker can..."`.
 3. `confidence` must be `speculative` — never `likely` or `confirmed` for a prospective chain.
 4. `verification_needed` must contain **exactly the uncovered command(s)** that would confirm
-   or refute the chain. Use exact IOS XE syntax.
+   or refute the chain. **Choose from the "Available Commands" list in the user message** — do not
+   invent command strings.
 5. Create at most **2 prospective chains per trial** — prioritise highest severity combinations.
 
 **When NOT to create a prospective chain:**

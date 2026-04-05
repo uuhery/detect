@@ -11,15 +11,16 @@
   4. Fact 是原子，AttackChain 是分子 — 复合链由 ≥2 个独立事实组合推断
 
 节点与字段的读写关系：
-  think()   读: command_history(recent), executed_commands, attack_chains,
-                next_probes, device_os, trial_count
+  think()   读: available_commands, executed_commands, next_probes, directions,
+                command_history(recent), trial_count
             写: reasoning, proposed_command
 
   act()     读: proposed_command, executed_commands
             写: command_history(append), executed_commands(append), trial_count(+1)
 
   analyze() 读: command_history[-1], facts, attack_chains, device_os   [Iter 2]
-            写: facts(append), attack_chains(upsert), next_probes, device_os
+            写: facts(append), attack_chains(upsert), next_probes, device_os,
+                available_commands（仅在 show running-config 时派生）
 """
 
 from typing import Annotated
@@ -136,6 +137,16 @@ class AuditState(TypedDict):
     attack_chains: list[AttackChain] # 发现的复合攻击链
                                      # Agent 的核心产出，区别于规则系统的关键字段
                                      # Iter 1 阶段始终为空列表，Iter 2 后开始填充
+
+    # ── 命令候选集（analyze 从 running-config 派生，Iter 3 引入） ────────────
+    available_commands: list[str]  # 从 show running-config 输出派生的本会话命令候选集。
+                                   # 每条命令满足两个条件：
+                                   #   1. 语法正确（来自 _COMMAND_TEMPLATES，非 LLM 生成）
+                                   #   2. 与设备实际配置相关（触发条件在 running-config 中存在）
+                                   # think 节点从此列表中选命令，不自由生成字符串。
+                                   # 设计目的：把命令语法正确性从 LLM 知识转移到代码保证。
+                                   # 初始为空列表；analyze 处理 show running-config 后填充；
+                                   # 后续命令的 analyze 不更新它（running-config 是唯一来源）。
 
     # ── 调查方向（plan → think 的战略输入，Iter 3 引入） ────────────────────
     directions: list[dict]  # plan 节点输出的有优先级的调查方向列表。
