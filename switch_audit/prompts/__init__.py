@@ -11,3 +11,8 @@ def load_system_prompt() -> str:
 def load_analyze_prompt() -> str:
     prompt_path = Path(__file__).parent / "analyze.md"
     return prompt_path.read_text(encoding="utf-8")
+
+
+def load_plan_prompt() -> str:
+    prompt_path = Path(__file__).parent / "plan.md"
+    return prompt_path.read_text(encoding="utf-8")

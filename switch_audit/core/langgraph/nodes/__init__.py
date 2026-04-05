@@ -26,7 +26,7 @@ logging.getLogger("paramiko").setLevel(logging.WARNING)
 from switch_audit.core.config import settings
 from switch_audit.core.langgraph.state import AuditState, CommandRecord
 from switch_audit.core.logging import logger
-from switch_audit.prompts import load_analyze_prompt, load_system_prompt
+from switch_audit.prompts import load_analyze_prompt, load_plan_prompt, load_system_prompt
 from switch_audit.tools import ssh_exec
 
 _llm = ChatOpenAI(
@@ -605,3 +605,164 @@ def analyze(state: AuditState) -> dict:
         result["device_os"] = device_os
 
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Iter 3：plan 节点（战略层 — BFS 决策）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_plan_context(state: AuditState) -> str:
+    """构建 plan() 的 user message。
+
+    plan 是战略层，需要"全局视野"：所有已知 Facts + AttackChains + 已执行命令 + device_os。
+    目的是让 LLM 决定"往哪里挖"，而不是"怎么挖"。
+
+    设计要点：
+    - Facts 省略 raw_evidence（plan 不需要证据原文，只需要摘要判断方向）
+    - AttackChains 包含 confidence（plan 需要知道哪些链已 confirmed，哪些还需验证）
+    - 当前 directions 传入（Refiner 模式下可以参考已有方向，避免重复）
+    - trial_count 传入（让 LLM 判断是 Generator 模式还是 Refiner 模式）
+    """
+    facts = state.get("facts", [])
+    chains = state.get("attack_chains", [])
+    executed = state.get("executed_commands", [])
+    trial_count = state.get("trial_count", 0)
+    device_os = state.get("device_os", "")
+    current_directions = state.get("directions", [])
+
+    # 段一：基本信息
+    header = (
+        f"Target: {state['target']}"
+        + (f" | OS: {device_os}" if device_os else "")
+        + f" | Trial: {trial_count}"
+        + f" | Commands executed: {len(executed)}"
+    )
+
+    # 段二：已执行命令（让 plan 知道哪些面已经覆盖）
+    executed_section = (
+        "## Commands Executed\n"
+        + ("\n".join(f"  - {c}" for c in executed) if executed else "  (none yet)")
+    )
+
+    # 段三：已有 Facts（id + source_command + content，无 raw_evidence）
+    if facts:
+        facts_lines = [
+            f"  [{f['id']}] (from `{f['source_command']}`): {f['content']}"
+            for f in facts
+        ]
+        facts_section = "## Existing Facts\n" + "\n".join(facts_lines)
+    else:
+        facts_section = "## Existing Facts\n  (none yet — this is the initial planning call)"
+
+    # 段四：已有 AttackChains（id + title + severity + confidence + fact_ids）
+    if chains:
+        chains_lines = [
+            f"  [{c['id']}] \"{c['title']}\" | severity={c['severity']} | "
+            f"confidence={c['confidence']} | facts={c['fact_ids']}"
+            for c in chains
+        ]
+        chains_section = "## Existing AttackChains\n" + "\n".join(chains_lines)
+    else:
+        chains_section = "## Existing AttackChains\n  (none yet)"
+
+    # 段五：当前调查方向（Refiner 模式参考）
+    if current_directions:
+        dir_lines = [
+            f"  [{d['priority']}] {d['focus']} — {d['rationale']}"
+            for d in current_directions
+        ]
+        directions_section = (
+            "## Current Directions (from previous plan call — refine or replace)\n"
+            + "\n".join(dir_lines)
+        )
+    else:
+        directions_section = "## Current Directions\n  (none — this is the first plan call)"
+
+    return "\n\n".join([header, executed_section, facts_section, chains_section, directions_section])
+
+
+def _parse_plan_response(raw: str) -> list[dict]:
+    """从 LLM 输出解析 directions 列表。
+
+    返回：list[dict]，每项包含 priority, focus, rationale。
+    解析失败 → [] + warning log（plan 失败时 think 仍能靠 next_probes 继续工作）。
+    """
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    text = match.group(1) if match else raw.strip()
+
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("plan.parse_failed", raw_preview=raw[:300])
+        return []
+
+    raw_dirs = data.get("directions", [])
+    directions: list[dict] = []
+    for d in raw_dirs:
+        if not isinstance(d, dict):
+            continue
+        focus = d.get("focus", "").strip()
+        if not focus:
+            continue
+        directions.append({
+            "priority": d.get("priority", len(directions) + 1),
+            "focus": focus,
+            "rationale": d.get("rationale", ""),
+        })
+
+    # 硬上限 3 个，防止 LLM 违反约束
+    return directions[:3]
+
+
+def plan(state: AuditState) -> dict:
+    """战略层：综合所有已知信息，生成 1-3 个有优先级的调查方向。
+
+    职责（Iter 3 核心）：
+    - 读: facts, attack_chains, executed_commands, device_os, trial_count, directions
+    - 写: directions（完全替换，不追加）
+
+    触发时机（由 graph.py 的路由函数决定，此函数不做判断）：
+    - trial_count == 0：session 开始，生成初始侦察方向（Generator 模式）
+    - analyze 产出新的 confirmed chain：重大发现，更新调查方向（Refiner 模式）
+
+    设计约束（plan.md 提示词层面已说明，代码层面强制）：
+    - directions 上限 3 个（_parse_plan_response 截断）
+    - plan 不写 facts/attack_chains/next_probes（只写 directions）
+    - directions 不包含具体命令（提示词约束，代码无法直接验证）
+    """
+    logger.info(
+        "node.plan",
+        trial=state["trial_count"],
+        target=state["target"],
+        facts_count=len(state.get("facts", [])),
+        chains_count=len(state.get("attack_chains", [])),
+        current_directions=len(state.get("directions", [])),
+    )
+
+    user_msg = _build_plan_context(state)
+
+    response = _llm.invoke([
+        {"role": "system", "content": load_plan_prompt()},
+        {"role": "user", "content": user_msg},
+    ])
+
+    directions = _parse_plan_response(response.content.strip())
+
+    # 记录本次 plan 时的 confirmed chain 数量快照。
+    # 路由函数用这个快照对比下一轮 analyze 后的 confirmed 数量，判断是否需要重规划。
+    confirmed_snapshot = sum(
+        1 for c in state.get("attack_chains", [])
+        if c.get("confidence") == "confirmed"
+    )
+
+    logger.info(
+        "node.plan.result",
+        directions_count=len(directions),
+        directions=[d["focus"] for d in directions],
+        confirmed_snapshot=confirmed_snapshot,
+    )
+
+    return {
+        "directions": directions,
+        "_plan_confirmed_count": confirmed_snapshot,
+    }

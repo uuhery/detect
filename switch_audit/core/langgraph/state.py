@@ -137,6 +137,13 @@ class AuditState(TypedDict):
                                      # Agent 的核心产出，区别于规则系统的关键字段
                                      # Iter 1 阶段始终为空列表，Iter 2 后开始填充
 
+    # ── 调查方向（plan → think 的战略输入，Iter 3 引入） ────────────────────
+    directions: list[dict]  # plan 节点输出的有优先级的调查方向列表。
+                            # 每项：{"priority": int, "focus": str, "rationale": str}
+                            # think 节点读取这些方向，在约束范围内选最优命令。
+                            # 存在理由：把"往哪里挖（BFS）"从 think 中剥离，让 think 专注"怎么挖（DFS）"。
+                            # 触发时机：trial=0（初始规划）；analyze 产出新 confirmed 链（重规划）。
+
     # ── 调查引导（analyze → think 的反馈回路，Iter 2 引入） ─────────────────
     next_probes: list[str]  # analyze 节点根据 attack_chains.verification_needed 汇总的
                             # 高优先级下一步命令。think 节点优先从此列表选择。
@@ -155,3 +162,11 @@ class AuditState(TypedDict):
     # ── 控制 ─────────────────────────────────────────────────────────────────
     trial_count: int
     status: str  # "running" | "completed" | "error"
+
+    # ── 内部路由辅助（不暴露给 LLM） ─────────────────────────────────────────
+    _plan_confirmed_count: int  # plan() 执行时记录的 confirmed AttackChain 数量快照。
+                                # 路由函数用它判断：当前 confirmed 数 > 快照 → 有新发现 → 触发重规划。
+                                # 初始值 -1（确保 trial=0 时 plan 已执行后，confirmed=0 > -1 不成立，
+                                # 不会在首轮 analyze 后立即再次触发 plan）。
+                                # 设计权衡：用一个 int 字段替代"是否需要重规划"的复杂判断逻辑，
+                                # 代价是 state 多一个内部字段，收益是路由逻辑清晰可测试。

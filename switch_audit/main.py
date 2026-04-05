@@ -46,6 +46,8 @@ def run_audit(target: str, session_id: str | None = None) -> None:
         # 分析产物（Iter 2 的 analyze 节点填充，此处初始化为空）
         "facts": [],
         "attack_chains": [],
+        # 调查方向（Iter 3 的 plan 节点填充）
+        "directions": [],
         # 调查引导（Iter 2 后由 analyze 节点维护）
         "next_probes": [],
         # think 节点产物
@@ -54,6 +56,8 @@ def run_audit(target: str, session_id: str | None = None) -> None:
         # 控制
         "trial_count": 0,
         "status": "running",
+        # 内部路由辅助（plan 节点写入，路由函数读取）
+        "_plan_confirmed_count": -1,
     }
     config = {"configurable": {"thread_id": session_id}}
 
