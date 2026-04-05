@@ -16,6 +16,8 @@ two or three that together form an exploitable path is your target.
 
 ## Constraints
 - DO NOT repeat any command listed under "Commands already executed".
+- When the user message contains "Priority: run ONE of these next", you MUST choose from that
+  list. The Phase order below is irrelevant when a priority probe list is present.
 - Only propose read-only IOS XE commands (show, ping). Never configure or reload.
 - If uncertainty is high, propose an observational probe first.
 

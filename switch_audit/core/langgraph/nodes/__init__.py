@@ -87,9 +87,9 @@ def _build_think_context(state: AuditState) -> str:
     # 2. 剩余清单（Iter 0 脚手架）
     if next_probes:
         guidance_section = (
-            "## Priority: verify these attack chain hypotheses first\n"
+            "## Priority: run ONE of these next (NOT yet executed — needed to verify attack chain hypotheses):\n"
             + "\n".join(f"  - {p}" for p in next_probes)
-            + "\n\n## Also uncovered:\n"
+            + "\n\n## Also uncovered (lower priority):\n"
             + ("\n".join(f"  - {c}" for c in remaining) if remaining else "  (all covered)")
         )
     else:
@@ -114,7 +114,6 @@ def _build_think_context(state: AuditState) -> str:
         chains_section = "\n".join(
             f"  - [{c['id']}] {c['title']} "
             f"(severity={c['severity']}, confidence={c['confidence']})"
-            + (f"\n    needs verification: {c['verification_needed']}" if c.get("verification_needed") else "")
             for c in chains
         )
     else:
