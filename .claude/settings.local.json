@@ -5,7 +5,8 @@
       "Bash(uv run python:*)",
       "Bash(find:*)",
       "Bash(grep:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(git show:*)"
     ]
   }
 }

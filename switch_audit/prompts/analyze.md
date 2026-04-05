@@ -29,6 +29,24 @@ Only extract facts with **security relevance**. Skip purely informational output
 A Fact **must** have a real `raw_evidence` line quoted verbatim from the command output.
 Do **not** invent or infer Facts for commands that have not been executed yet — no output means no Fact.
 
+### Special case: `show running-config` — scan for absent security controls
+
+When `source_command` is `show running-config`, the most security-relevant facts are often
+**configurations that are missing**, not ones that are present. Actively look for:
+
+| What to look for | Security-relevant absence |
+|---|---|
+| `interface … switchport mode trunk` with no `switchport trunk native vlan <N>` on that same interface | Native VLAN defaults to 1 — VLAN hopping risk |
+| `spanning-tree mode …` present but no `spanning-tree portfast bpduguard default` anywhere | No global BPDU guard — STP manipulation risk |
+| `switchport access vlan <N>` interfaces with no `switchport port-security` | Port security absent on access ports |
+| `ip http server` or `ip http secure-server` with no `ip http access-class` | HTTP management has no source IP restriction |
+| VTY lines with `exec-timeout 0 0` | Sessions never time out — persistent access after compromise |
+| No `banner login` or `banner motd` block anywhere | No legal warning banner |
+
+Extract each absence as a separate Fact, with `raw_evidence` quoting the **relevant present lines**
+that make the absence detectable (e.g., the trunk interface block without native vlan, or
+`spanning-tree mode rapid-pvst` without any bpduguard line).
+
 ---
 
 ## Rule 2: Compound Chains Require ≥2 Facts from ≥2 Different Commands
