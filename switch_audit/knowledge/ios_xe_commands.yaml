@@ -1,0 +1,186 @@
+# IOS XE Show Command Knowledge Base
+# 单一事实来源（SSOT）：所有节点的命令提示都从此文件生成。
+# 维护规则：
+#   - 只收录在标准 Cisco IOS XE 上可执行的只读 show/ping 命令
+#   - 命令必须可直接粘贴执行（exact syntax）
+#   - 新增命令请注明用途（desc）和所属类别（category）
+#   - 不收录 configure / reload / write 等写操作命令
+
+categories:
+
+  - id: identity
+    name: "设备身份与全局配置"
+    desc: "获取设备型号、版本、完整配置，是每次审计的起点"
+    commands:
+      - cmd: "show version"
+        desc: "IOS XE 版本、硬件型号、序列号、运行时长"
+      - cmd: "show running-config"
+        desc: "完整运行配置，最高信息密度来源"
+      - cmd: "show inventory"
+        desc: "硬件模块清单（包括 SFP、电源模块）"
+      - cmd: "show processes cpu"
+        desc: "CPU 使用率，可发现异常进程负载"
+
+  - id: layer2
+    name: "二层网络 / VLAN / STP"
+    desc: "VLAN 隔离、生成树操控、MAC 泛洪等二层攻击面"
+    commands:
+      - cmd: "show vlan"
+        desc: "VLAN 列表及端口成员关系"
+      - cmd: "show vlan brief"
+        desc: "VLAN 摘要（Active/Inactive 状态）"
+      - cmd: "show mac address-table"
+        desc: "动态/静态 MAC 地址表（注意：空格，非连字符）"
+      - cmd: "show mac address-table count"
+        desc: "MAC 表条目数量，可发现 CAM 溢出迹象"
+      - cmd: "show spanning-tree"
+        desc: "STP 拓扑、端口角色、Root Bridge 信息"
+      - cmd: "show spanning-tree detail"
+        desc: "STP 详细参数，含 PortFast / BPDU Guard 状态"
+      - cmd: "show spanning-tree summary"
+        desc: "全局 STP 模式及 PortFast/BPDU Guard 全局开关"
+      - cmd: "show interfaces trunk"
+        desc: "Trunk 端口、允许 VLAN 列表、Native VLAN"
+      - cmd: "show interfaces switchport"
+        desc: "每个端口的 access/trunk 模式及 VLAN 分配"
+      - cmd: "show etherchannel summary"
+        desc: "端口聚合组状态，排查误配置的 LACP/PAgP"
+
+  - id: interfaces
+    name: "接口状态与计数"
+    desc: "接口错误计数可反映端口安全违规或异常流量"
+    commands:
+      - cmd: "show interfaces"
+        desc: "所有接口详细状态与计数器"
+      - cmd: "show ip interface brief"
+        desc: "接口 IP 地址及 Up/Down 摘要"
+      - cmd: "show interfaces status"
+        desc: "端口速率、双工、连接状态一览"
+      - cmd: "show interfaces counters errors"
+        desc: "错误帧计数，反映物理层或攻击迹象"
+
+  - id: access_auth
+    name: "访问控制与认证"
+    desc: "SSH/Telnet 配置、特权级别、登录用户、AAA 策略"
+    commands:
+      - cmd: "show ip ssh"
+        desc: "SSH 版本、认证超时、重试次数"
+      - cmd: "show line vty 0 4"
+        desc: "VTY 线路配置：transport input、exec-timeout、login"
+      - cmd: "show line vty 0 15"
+        desc: "扩展 VTY 线路配置（15 线路设备）"
+      - cmd: "show users"
+        desc: "当前已登录用户及其来源 IP"
+      - cmd: "show privilege"
+        desc: "当前会话特权级别（15=全权限）"
+      - cmd: "show aaa servers"
+        desc: "RADIUS/TACACS+ 服务器列表及可达性"
+      - cmd: "show aaa sessions"
+        desc: "活跃 AAA 认证会话"
+      - cmd: "show tacacs"
+        desc: "TACACS+ 服务器详细状态"
+      - cmd: "show radius server-group all"
+        desc: "RADIUS 服务器组配置"
+
+  - id: port_security
+    name: "端口安全"
+    desc: "防止 MAC 泛洪和未授权设备接入"
+    commands:
+      - cmd: "show port-security"
+        desc: "全局端口安全摘要：违规动作、已学习 MAC 数"
+      - cmd: "show port-security address"
+        desc: "已绑定的安全 MAC 地址列表"
+      - cmd: "show storm-control"
+        desc: "广播/组播/单播风暴控制阈值"
+      - cmd: "show dot1x all"
+        desc: "802.1X 全局及各端口认证状态"
+      - cmd: "show dot1x statistics"
+        desc: "802.1X 认证统计计数"
+
+  - id: management_protocols
+    name: "管理协议"
+    desc: "CDP/LLDP 信息泄露、HTTP 未授权访问、SNMP 社区字符串"
+    commands:
+      - cmd: "show cdp neighbors"
+        desc: "CDP 邻居设备列表（设备名、接口、平台）"
+      - cmd: "show cdp neighbors detail"
+        desc: "CDP 邻居详情，含 IP 地址和 IOS 版本（高信息泄露风险）"
+      - cmd: "show lldp neighbors"
+        desc: "LLDP 邻居列表（非 Cisco 设备互操作）"
+      - cmd: "show lldp neighbors detail"
+        desc: "LLDP 邻居详情"
+      - cmd: "show ip http server status"
+        desc: "HTTP 管理服务端口、访问类、认证方式"
+      - cmd: "show ip http secure-server status"
+        desc: "HTTPS 管理服务状态"
+      - cmd: "show snmp community"
+        desc: "SNMP 社区字符串（RO/RW 权限，可写社区=远程配置漏洞）"
+      - cmd: "show snmp user"
+        desc: "SNMPv3 用户列表及认证/加密配置"
+      - cmd: "show snmp group"
+        desc: "SNMPv3 用户组及访问级别"
+      - cmd: "show snmp host"
+        desc: "SNMP trap 接收方（数据外泄路径）"
+
+  - id: time_sync
+    name: "时间同步"
+    desc: "NTP 未认证可被操控，影响日志、证书和 AAA 时间戳"
+    commands:
+      - cmd: "show ntp status"
+        desc: "NTP 同步状态、层级、参考源"
+      - cmd: "show ntp associations"
+        desc: "NTP 对等体列表及认证状态"
+      - cmd: "show clock detail"
+        desc: "当前时钟、时区及来源"
+
+  - id: acl_routing
+    name: "ACL 与路由"
+    desc: "访问控制列表漏洞、管理平面过滤缺失"
+    commands:
+      - cmd: "show ip access-lists"
+        desc: "所有 IPv4 ACL 规则及命中计数"
+      - cmd: "show ipv6 access-list"
+        desc: "IPv6 ACL 规则"
+      - cmd: "show ip route"
+        desc: "路由表（发现异常路由注入或路由泄露）"
+      - cmd: "show ip bgp summary"
+        desc: "BGP 邻居状态（若设备运行 BGP）"
+
+  - id: dhcp_arp
+    name: "DHCP Snooping / ARP Inspection"
+    desc: "防 ARP 欺骗和流氓 DHCP 服务器攻击的关键控制"
+    commands:
+      - cmd: "show ip dhcp snooping"
+        desc: "DHCP Snooping 全局状态及信任端口"
+      - cmd: "show ip dhcp snooping binding"
+        desc: "DHCP Snooping 绑定表（IP-MAC-端口映射）"
+      - cmd: "show ip dhcp snooping statistics"
+        desc: "DHCP Snooping 丢包统计"
+      - cmd: "show ip arp inspection"
+        desc: "动态 ARP Inspection 全局状态"
+      - cmd: "show ip arp inspection vlan 1"
+        desc: "VLAN 1 的 ARP Inspection 统计（按需替换 VLAN 编号）"
+
+  - id: crypto
+    name: "加密与证书"
+    desc: "弱加密套件、过期证书、密钥长度不足"
+    commands:
+      - cmd: "show crypto pki certificates"
+        desc: "已安装证书列表及有效期"
+      - cmd: "show crypto pki trustpoints"
+        desc: "PKI 信任点配置"
+      - cmd: "show crypto key mypubkey rsa"
+        desc: "RSA 密钥长度（<2048 为弱密钥）"
+      - cmd: "show crypto isakmp sa"
+        desc: "IKE/IPSec SA 状态（若有 VPN）"
+
+  - id: logging
+    name: "日志与审计"
+    desc: "日志缺失意味着攻击无法追溯"
+    commands:
+      - cmd: "show logging"
+        desc: "系统日志缓冲区及远程 syslog 配置"
+      - cmd: "show logging history"
+        desc: "历史严重告警"
+      - cmd: "show archive log config all"
+        desc: "配置变更审计日志（若启用 archive）"

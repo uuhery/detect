@@ -26,7 +26,11 @@ logging.getLogger("paramiko").setLevel(logging.WARNING)
 from switch_audit.core.config import settings
 from switch_audit.core.langgraph.state import AuditState, CommandRecord
 from switch_audit.core.logging import logger
-from switch_audit.prompts import load_analyze_prompt, load_system_prompt
+from switch_audit.prompts import (
+    all_valid_commands,
+    load_analyze_prompt,
+    load_system_prompt,
+)
 from switch_audit.tools import ssh_exec
 
 _llm = ChatOpenAI(
@@ -36,25 +40,9 @@ _llm = ChatOpenAI(
     base_url=settings.OPENAI_BASE_URL,
 )
 
-# Iter 0 脚手架：临时侦察清单，告知 LLM 还有哪些方向未覆盖。
-# Iter 3（动态规划节点）落地后删除。
-_RECON_CHECKLIST: Final[list[str]] = [
-    "show version",
-    "show running-config",
-    "show ip interface brief",
-    "show mac address-table",
-    "show vlan",
-    "show spanning-tree",
-    "show spanning-tree detail",
-    "show ip ssh",
-    "show line vty 0 4",
-    "show users",
-    "show privilege",
-    "show cdp neighbors",
-    "show interfaces trunk",
-    "show port-security",
-    "show ip http server status",
-]
+# 从知识库加载命令全集（SSOT：与注入进 prompt 的命令列表完全一致）
+# all_valid_commands() 有 lru_cache，只读一次 YAML。
+_RECON_CHECKLIST: Final[list[str]] = all_valid_commands()
 
 # think() 构建上下文时最多使用最近 N 条命令记录（Iter 4 引入摘要前的临时限制）
 _CONTEXT_WINDOW_RECENT = 6

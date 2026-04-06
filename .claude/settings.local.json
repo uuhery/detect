@@ -6,7 +6,15 @@
       "Bash(find:*)",
       "Bash(grep:*)",
       "Bash(python:*)",
-      "Bash(git show:*)"
+      "Bash(git show:*)",
+      "Bash(git checkout:*)",
+      "WebSearch",
+      "WebFetch(domain:pubhub.devnetcloud.com)",
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(.venv/Scripts/pip.exe install:*)",
+      "WebFetch(domain:python.langchain.com)",
+      "WebFetch(domain:langchain-ai.github.io)",
+      "WebFetch(domain:docs.langchain.com)"
     ]
   }
 }
