@@ -443,11 +443,15 @@ def _parse_analyze_response(raw: str, current_trial: int) -> tuple[list, list, s
         verification = c.get("verification_needed", [])
         if not isinstance(verification, list):
             verification = [verification] if verification else []
-        # confidence 由结构派生：verification_needed 非空则不可能是 confirmed。
-        # LLM 声明的 confidence 只在 speculative/likely 之间有参考价值；
-        # confirmed 完全由代码决定，不依赖 LLM 自我检查。
+        # confidence 由结构派生：
+        # - "refuted" 是唯一由 LLM 主动下调的值，代码直接采纳。
+        # - verification_needed 非空 → 只能是 speculative/likely（代码决定，不信任 LLM 的 confirmed）。
+        # - verification_needed 为空 → 代码强制 confirmed（与 LLM 声明无关）。
         llm_confidence = c.get("confidence", "speculative")
-        if verification:
+        if llm_confidence == "refuted":
+            confidence = "refuted"
+            verification = []   # 已被否定的链不需要继续验证
+        elif verification:
             confidence = llm_confidence if llm_confidence in ("speculative", "likely") else "likely"
         else:
             confidence = "confirmed"
@@ -540,11 +544,26 @@ def _upsert_attack_chains(existing: list, updates: list) -> list:
             idx = id_to_index[existing_id]
             target = result[idx]
 
-            # confidence 只升级（单调性）
-            current_rank = _CONFIDENCE_RANK.get(target.get("confidence", "speculative"), 0)
-            new_rank = _CONFIDENCE_RANK.get(update.get("confidence", "speculative"), 0)
-            if new_rank > current_rank:
-                target["confidence"] = update["confidence"]
+            new_conf = update.get("confidence", "speculative")
+            if new_conf == "refuted":
+                # 矛盾证据降级：refuted 覆盖任何已有置信度（包括 confirmed）
+                # 一旦 refuted，不再接受升级（由外层 already-refuted guard 保证）
+                target["confidence"] = "refuted"
+                target["verification_needed"] = []
+                logger.info(
+                    "upsert.chain_refuted",
+                    chain_id=existing_id,
+                    narrative_preview=update.get("attack_narrative", "")[:80],
+                )
+            elif target.get("confidence") == "refuted":
+                # 已被否定的链不允许重新升级（新证据应该创建新链）
+                pass
+            else:
+                # 正常单调升级（speculative → likely → confirmed）
+                current_rank = _CONFIDENCE_RANK.get(target.get("confidence", "speculative"), 0)
+                new_rank = _CONFIDENCE_RANK.get(new_conf, 0)
+                if new_rank > current_rank:
+                    target["confidence"] = new_conf
 
             # fact_ids 追加去重
             existing_fact_set = set(target.get("fact_ids", []))
@@ -841,16 +860,19 @@ def report(state: AuditState) -> dict:
     # facts 索引：id → dict，供链渲染时查找
     facts_by_id = {f["id"]: f for f in facts}
 
-    # 攻击链按 severity 排序
-    sorted_chains = sorted(chains, key=lambda c: _SEVERITY_RANK.get(c.get("severity", "medium"), 2))
+    # 拆分 refuted 链（单独展示）vs 活跃链（按 severity 排序）
+    active_chains = [c for c in chains if c.get("confidence") != "refuted"]
+    refuted_chains = [c for c in chains if c.get("confidence") == "refuted"]
 
-    # 统计各 severity 数量
+    sorted_chains = sorted(active_chains, key=lambda c: _SEVERITY_RANK.get(c.get("severity", "medium"), 2))
+
+    # 统计各 severity 数量（仅统计活跃链）
     counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-    for c in chains:
+    for c in active_chains:
         sev = c.get("severity", "medium")
         counts[sev] = counts.get(sev, 0) + 1
 
-    confirmed_count = sum(1 for c in chains if c.get("confidence") == "confirmed")
+    confirmed_count = sum(1 for c in active_chains if c.get("confidence") == "confirmed")
 
     # ── 报告正文 ────────────────────────────────────────────────────────────
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -876,8 +898,9 @@ def report(state: AuditState) -> dict:
         f"| 🟠 High | {counts['high']} |",
         f"| 🟡 Medium | {counts['medium']} |",
         f"| 🟢 Low | {counts['low']} |",
-        f"| **Total chains** | **{len(chains)}** |",
+        f"| **Active chains** | **{len(active_chains)}** |",
         f"| Confirmed chains | {confirmed_count} |",
+        f"| Refuted paths | {len(refuted_chains)} |",
         f"| Facts extracted | {len(facts)} |",
         f"",
         f"---",
@@ -916,6 +939,25 @@ def report(state: AuditState) -> dict:
     else:
         sections.append("_No attack chains discovered._")
         sections.append("")
+
+    # ── 已否定的攻击路径（独立区块，不混入主攻击链） ───────────────────────────
+    if refuted_chains:
+        sections += [
+            f"## Refuted Attack Paths",
+            f"",
+            f"> The following hypotheses were **eliminated** by subsequent evidence. "
+            f"They are preserved for audit trail purposes.",
+            f"",
+        ]
+        for chain in refuted_chains:
+            sections += [
+                f"- **[{chain['id']}] {chain['title']}** "
+                f"(originally {chain.get('severity', 'medium')}, "
+                f"first seen trial {chain.get('trial_first_seen', '?')})",
+                f"  {chain.get('attack_narrative', '(no reason recorded)')}",
+                f"",
+            ]
+        sections += [f"---", f""]
 
     sections += [
         f"## Facts Index",

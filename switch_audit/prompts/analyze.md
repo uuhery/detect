@@ -122,8 +122,21 @@ You will receive a list of existing AttackChains with their IDs (e.g., `c1-0`, `
 - If new facts **strengthen, confirm, or extend** an existing chain → set `existing_chain_id` to that chain's ID.
 - If it is a **genuinely new chain** not covered by any existing entry → set `existing_chain_id` to `null`.
 
-Confidence can only **increase** (speculative → likely → confirmed), never decrease.
-If your analysis does not increase confidence, keep the existing level — do not downgrade.
+Confidence normally only **increases** (speculative → likely → confirmed).
+
+**Exception — Refutation**: You may set `confidence: "refuted"` if a new Fact directly eliminates a chain's exploitability. All three conditions must hold simultaneously:
+
+1. The refuting Fact comes from **actual command output** (verbatim, not inferred or absent).
+2. The Fact **directly negates a critical step** in `attack_narrative` — not just weakens it.
+   - "HTTP authentication method is RADIUS" refutes "attacker authenticates via enable password through HTTP". ✓
+   - "exec-timeout 5 0" does NOT refute "attacker maintains persistent session after initial compromise". ✗
+3. That step is on the **critical path** — without it, the entire chain collapses.
+
+When refuting a chain:
+- Set `confidence: "refuted"` and `verification_needed: []` (no further probing needed).
+- Update `attack_narrative` to one sentence explaining what was disproved and by which Fact.
+
+**Do NOT refute based on:** absence of output, conditions that weaken but don't eliminate the attack, or Facts that apply to a different interface/device than the chain targets.
 
 ---
 
