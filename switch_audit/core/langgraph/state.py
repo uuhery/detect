@@ -152,6 +152,9 @@ class AuditState(TypedDict):
                            # 替代原来从 JSON blob hypothesis 中用 regex 解析 proposed_action
                            # act() 直接读取，无需解析，消除了解析失败回退到 "id" 的脆弱性
 
+    # ── 报告（report 节点填充，审计结束时生成） ─────────────────────────────
+    report_path: str  # 生成的 Markdown 报告文件的绝对路径，空字符串表示尚未生成
+
     # ── 控制 ─────────────────────────────────────────────────────────────────
     trial_count: int
     status: str  # "running" | "completed" | "error"

@@ -48,6 +48,8 @@ def run_audit(target: str, session_id: str | None = None) -> None:
         "attack_chains": [],
         # 调查引导（Iter 2 后由 analyze 节点维护）
         "next_probes": [],
+        # 报告（report 节点填充）
+        "report_path": "",
         # think 节点产物
         "reasoning": "",
         "proposed_command": "",
@@ -67,7 +69,11 @@ def run_audit(target: str, session_id: str | None = None) -> None:
         facts_found=len(result["facts"]),
         chains_found=len(result["attack_chains"]),
         status=result["status"],
+        report_path=result.get("report_path", ""),
     )
+
+    if result.get("report_path"):
+        print(f"\nReport written to: {result['report_path']}\n")
 
     # Time-travel demo: show every checkpointed state transition
     logger.info("audit.checkpoint_history")

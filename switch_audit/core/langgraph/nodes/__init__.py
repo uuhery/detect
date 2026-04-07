@@ -15,6 +15,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Final
 
 from langchain_openai import ChatOpenAI
@@ -671,3 +672,161 @@ def analyze(state: AuditState) -> dict:
         result["device_os"] = device_os
 
     return result
+
+
+# ── severity 排序权重（report 节点使用） ────────────────────────────────────
+_SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def _render_chain(chain: dict, facts_by_id: dict) -> str:
+    """将单条 AttackChain 渲染为 Markdown 段落。"""
+    severity = chain.get("severity", "medium").upper()
+    confidence = chain.get("confidence", "speculative")
+    lines = [
+        f"### [{severity}] {chain['title']}",
+        f"",
+        f"- **ID**: `{chain['id']}`",
+        f"- **Confidence**: {confidence}",
+        f"- **First seen**: trial {chain.get('trial_first_seen', '?')}",
+        f"",
+        f"**Attack narrative**",
+        f"",
+        f"{chain.get('attack_narrative', '(none)')}",
+        f"",
+        f"**Supporting facts**",
+        f"",
+    ]
+    for fid in chain.get("fact_ids", []):
+        fact = facts_by_id.get(fid)
+        if fact:
+            lines.append(f"- `{fid}` ({fact['source_command']}): {fact['content']}")
+            if fact.get("raw_evidence"):
+                # 缩进引用，最多显示 3 行
+                evidence_lines = fact["raw_evidence"].strip().splitlines()[:3]
+                lines.append(f"  > `{'  '.join(evidence_lines)}`")
+        else:
+            lines.append(f"- `{fid}` (fact not found)")
+
+    if chain.get("verification_needed"):
+        lines += [
+            f"",
+            f"**Verification commands needed**",
+            f"",
+        ]
+        for cmd in chain["verification_needed"]:
+            lines.append(f"- `{cmd}`")
+
+    return "\n".join(lines)
+
+
+def report(state: AuditState) -> dict:
+    """审计结束后生成 Markdown 报告，写入磁盘，返回 report_path。
+
+    报告结构：
+      1. 标题 + 元数据（目标、OS、时间、trial 数）
+      2. 执行摘要（各 severity 链的数量统计）
+      3. 攻击链详情（按 severity 排序：critical → high → medium → low）
+         每条链：标题、叙述、关联 facts + raw_evidence
+      4. Facts 索引（所有 facts 的扁平列表，按 trial 排序）
+
+    纯代码生成，不调用 LLM。
+    报告写入 reports/<target>_<session_id[:8]>.md（相对于项目根目录）。
+    """
+    target = state["target"]
+    session_id = state.get("session_id", "unknown")
+    started_at = state.get("started_at", "")
+    device_os = state.get("device_os", "unknown")
+    trial_count = state.get("trial_count", 0)
+    chains = state.get("attack_chains", [])
+    facts = state.get("facts", [])
+
+    logger.info(
+        "node.report",
+        target=target,
+        chains=len(chains),
+        facts=len(facts),
+        trials=trial_count,
+    )
+
+    # facts 索引：id → dict，供链渲染时查找
+    facts_by_id = {f["id"]: f for f in facts}
+
+    # 攻击链按 severity 排序
+    sorted_chains = sorted(chains, key=lambda c: _SEVERITY_RANK.get(c.get("severity", "medium"), 2))
+
+    # 统计各 severity 数量
+    counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for c in chains:
+        sev = c.get("severity", "medium")
+        counts[sev] = counts.get(sev, 0) + 1
+
+    confirmed_count = sum(1 for c in chains if c.get("confidence") == "confirmed")
+
+    # ── 报告正文 ────────────────────────────────────────────────────────────
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    sections = [
+        f"# Switch Security Audit Report",
+        f"",
+        f"| Field | Value |",
+        f"|-------|-------|",
+        f"| Target | `{target}` |",
+        f"| Device OS | {device_os} |",
+        f"| Audit started | {started_at} |",
+        f"| Report generated | {now} |",
+        f"| Trials executed | {trial_count} |",
+        f"| Commands executed | {len(state.get('executed_commands', []))} |",
+        f"",
+        f"---",
+        f"",
+        f"## Executive Summary",
+        f"",
+        f"| Severity | Count |",
+        f"|----------|-------|",
+        f"| 🔴 Critical | {counts['critical']} |",
+        f"| 🟠 High | {counts['high']} |",
+        f"| 🟡 Medium | {counts['medium']} |",
+        f"| 🟢 Low | {counts['low']} |",
+        f"| **Total chains** | **{len(chains)}** |",
+        f"| Confirmed chains | {confirmed_count} |",
+        f"| Facts extracted | {len(facts)} |",
+        f"",
+        f"---",
+        f"",
+        f"## Attack Chains",
+        f"",
+    ]
+
+    if sorted_chains:
+        for chain in sorted_chains:
+            sections.append(_render_chain(chain, facts_by_id))
+            sections.append("")
+            sections.append("---")
+            sections.append("")
+    else:
+        sections.append("_No attack chains discovered._")
+        sections.append("")
+
+    sections += [
+        f"## Facts Index",
+        f"",
+        f"All {len(facts)} security-relevant facts extracted during this audit.",
+        f"",
+    ]
+    for fact in facts:
+        sections.append(
+            f"- **`{fact['id']}`** (trial {fact['trial']}, `{fact['source_command']}`): {fact['content']}"
+        )
+
+    report_text = "\n".join(sections) + "\n"
+
+    # ── 写入磁盘 ────────────────────────────────────────────────────────────
+    reports_dir = Path(__file__).parent.parent.parent.parent / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    safe_target = target.replace(".", "_").replace(":", "_")
+    filename = f"{safe_target}_{session_id[:8]}.md"
+    report_file = reports_dir / filename
+    report_file.write_text(report_text, encoding="utf-8")
+
+    logger.info("node.report.written", path=str(report_file))
+
+    return {"report_path": str(report_file)}

@@ -26,7 +26,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from switch_audit.core.langgraph.nodes import act, analyze, think
+from switch_audit.core.langgraph.nodes import act, analyze, report, think
 from switch_audit.core.langgraph.state import AuditState
 from switch_audit.core.logging import logger
 
@@ -35,34 +35,36 @@ _MAX_TRIALS = 20
 
 
 def _should_continue(state: AuditState) -> str:
-    """路由函数：决定是否继续探测或停止。与 Iter 1 逻辑完全一致。"""
+    """路由函数：决定是否继续探测或进入报告阶段。"""
     if state["status"] != "running":
-        return END
+        return "report"
     if state["trial_count"] >= _MAX_TRIALS:
         logger.info("audit.max_trials_reached", trials=state["trial_count"])
-        return END
+        return "report"
     return "think"
 
 
 def build_graph() -> CompiledStateGraph:
-    """构建并编译具有内存检查点的审计图（Iter 2：think → act → analyze 三节点循环）。"""
+    """构建并编译审计图（Iter 3：think → act → analyze 循环，结束后 → report → END）。"""
     builder = StateGraph(AuditState)
 
     builder.add_node("think", think)
     builder.add_node("act", act)
-    builder.add_node("analyze", analyze)          # Iter 2 新增
+    builder.add_node("analyze", analyze)
+    builder.add_node("report", report)             # 审计结束后生成报告
 
     builder.add_edge(START, "think")
     builder.add_edge("think", "act")
-    builder.add_edge("act", "analyze")             # act 后无条件进 analyze
-    builder.add_conditional_edges(                 # 路由从 act 后移到 analyze 后
+    builder.add_edge("act", "analyze")
+    builder.add_conditional_edges(
         "analyze",
         _should_continue,
-        {"think": "think", END: END},
+        {"think": "think", "report": "report"},
     )
+    builder.add_edge("report", END)                # report 是终点
 
     checkpointer = MemorySaver()
     graph = builder.compile(checkpointer=checkpointer, name="switch-audit")
 
-    logger.info("graph.built", nodes=["think", "act", "analyze"], max_trials=_MAX_TRIALS)
+    logger.info("graph.built", nodes=["think", "act", "analyze", "report"], max_trials=_MAX_TRIALS)
     return graph
