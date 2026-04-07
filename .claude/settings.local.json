@@ -15,7 +15,14 @@
       "WebFetch(domain:python.langchain.com)",
       "WebFetch(domain:langchain-ai.github.io)",
       "WebFetch(domain:docs.langchain.com)",
-      "Read(//c/Users/marimo/.claude/plans//**)"
+      "Read(//c/Users/marimo/.claude/plans//**)",
+      "Bash(curl -s \"https://developer.cisco.com/site/devnet/sandbox/docs/\")",
+      "Bash(curl -s \"https://developer.cisco.com/legal/terms-and-conditions/\")",
+      "Bash(python3 -c \"import sys; from html.parser import HTMLParser; class P\\(HTMLParser\\): def __init__\\(self\\): super\\(\\).__init__\\(\\); self.text=[] def handle_data\\(self,d\\): self.text.append\\(d\\) p=P\\(\\); p.feed\\(sys.stdin.read\\(\\)\\); print\\(' '.join\\(p.text\\)\\)\")",
+      "WebFetch(domain:developer.cisco.com)",
+      "WebFetch(domain:devnetsandbox.cisco.com)",
+      "WebFetch(domain:www.cisco.com)",
+      "WebFetch(domain:content.ciscodcloud.com)"
     ]
   }
 }

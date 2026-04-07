@@ -414,6 +414,15 @@ def _parse_analyze_response(raw: str, current_trial: int) -> tuple[list, list, s
         verification = c.get("verification_needed", [])
         if not isinstance(verification, list):
             verification = [verification] if verification else []
+        # confidence 由结构派生：verification_needed 非空则不可能是 confirmed。
+        # LLM 声明的 confidence 只在 speculative/likely 之间有参考价值；
+        # confirmed 完全由代码决定，不依赖 LLM 自我检查。
+        llm_confidence = c.get("confidence", "speculative")
+        if verification:
+            confidence = llm_confidence if llm_confidence in ("speculative", "likely") else "likely"
+        else:
+            confidence = "confirmed"
+
         chain_updates.append({
             "existing_chain_id": c.get("existing_chain_id"),  # None 表示新建
             "id": c.get("id", f"c{current_trial}-{i}"),
@@ -421,13 +430,46 @@ def _parse_analyze_response(raw: str, current_trial: int) -> tuple[list, list, s
             "fact_ids": fact_ids,
             "attack_narrative": c.get("attack_narrative", ""),
             "severity": c.get("severity", "medium"),
-            "confidence": c.get("confidence", "speculative"),
+            "confidence": confidence,
             "verification_needed": verification,
             "trial_first_seen": c.get("trial_first_seen", current_trial),
         })
 
     device_os = data.get("device_os", "").strip()
     return new_facts, chain_updates, device_os
+
+
+def _find_overlapping_chain(existing: list, new_fact_ids: list) -> str | None:
+    """按 fact_ids 重叠度检测重复链，返回应被更新的已有链 ID。
+
+    判定标准：重叠数量同时满足：
+      ≥ 2（最低基线，单个共享 fact 不足以判定为同一攻击路径）
+      ≥ 新链 fact 数的一半（新链大部分证据已被现有链覆盖）
+      ≥ 已有链 fact 数的一半（反向：现有链大部分证据也被新链覆盖）
+
+    双向覆盖阈值防止误合并：
+      两条链仅共享一个"入口 fact"（如 HTTP 启用）但走向不同 impact → 不合并
+      两条链是同一路径的重述（大量 fact 重叠）→ 合并为 update
+    """
+    new_set = set(new_fact_ids)
+    if len(new_set) < 2:
+        return None
+    best_id: str | None = None
+    best_overlap = 0
+    for chain in existing:
+        existing_set = set(chain.get("fact_ids", []))
+        if not existing_set:
+            continue
+        overlap = len(new_set & existing_set)
+        if (
+            overlap >= 2
+            and overlap >= len(new_set) // 2
+            and overlap >= len(existing_set) // 2
+            and overlap > best_overlap
+        ):
+            best_overlap = overlap
+            best_id = chain["id"]
+    return best_id
 
 
 def _upsert_attack_chains(existing: list, updates: list) -> list:
@@ -452,6 +494,17 @@ def _upsert_attack_chains(existing: list, updates: list) -> list:
 
     for update in updates:
         existing_id = update.get("existing_chain_id")
+
+        # 结构性去重：LLM 未声明 existing_chain_id 时，按 fact 重叠自动匹配已有链
+        if not existing_id or existing_id not in id_to_index:
+            auto_match = _find_overlapping_chain(result, update.get("fact_ids", []))
+            if auto_match:
+                logger.info(
+                    "upsert.auto_deduplicated",
+                    new_title=update.get("title"),
+                    matched_to=auto_match,
+                )
+                existing_id = auto_match
 
         if existing_id and existing_id in id_to_index:
             # 更新已有链

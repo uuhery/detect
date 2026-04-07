@@ -78,8 +78,12 @@ A valid AttackChain:
 
 Do **not** create an AttackChain for a single isolated fact — that is just a finding, not a chain.
 
-**Before writing a chain, count the distinct `source_command` values in your `fact_ids`.
-If all facts come from the same command, this is not a chain — drop it.**
+**The ≥2 source_command rule applies to the complete chain as it exists in the system, not just your output.**
+
+- When **creating** a new chain (`existing_chain_id` is null): your `fact_ids` must already span ≥2 source_commands.
+- When **updating** an existing chain (`existing_chain_id` is set): only list the **new** fact_ids you are adding this turn. The system merges them with the chain's existing facts. The ≥2 source_command check is on the merged result — not on your output alone. If the existing chain already spans ≥2 source_commands, adding a single new fact from any command is valid.
+
+Do **not** repeat existing fact_ids when updating — only include the ones you are adding now.
 
 **Every numbered step in `attack_narrative` must be grounded in a specific Fact ID.**
 
@@ -90,15 +94,16 @@ Before finalising a chain, mentally check each step:
 
 If any step lacks a grounding Fact, the chain **must** remain `speculative` and that step must appear in `verification_needed` as the command that would confirm it.
 
-**Confidence rules (strictly enforced):**
+**Confidence is derived from `verification_needed` — the system enforces this, not you:**
 
-| confidence | Requirement |
+| `verification_needed` | `confidence` |
 |---|---|
-| `confirmed` | Every step in `attack_narrative` has a grounding Fact with `raw_evidence`. Zero ungrounded steps. |
-| `likely` | At most one step is inferred from strong indirect evidence; all other steps are grounded. |
-| `speculative` | One or more steps have no grounding Fact — only a plausible assumption. |
+| `[]` (empty) | always `confirmed` — the system sets this regardless of what you write |
+| non-empty | your value (`speculative` or `likely`) is used; `confirmed` is rejected |
 
-When in doubt, assign the **lower** confidence level. It is better to under-claim than to mark an unverified path as confirmed.
+**Your only job is to get `verification_needed` right.**
+If any step in `attack_narrative` is ungrounded, put the command that would confirm it in `verification_needed`.
+Do not write `"IF ... reveals ..."` in `attack_narrative` — that is a sign a step is ungrounded and belongs in `verification_needed` instead.
 
 ---
 
