@@ -22,7 +22,12 @@
       "WebFetch(domain:developer.cisco.com)",
       "WebFetch(domain:devnetsandbox.cisco.com)",
       "WebFetch(domain:www.cisco.com)",
-      "WebFetch(domain:content.ciscodcloud.com)"
+      "WebFetch(domain:content.ciscodcloud.com)",
+      "Bash(xargs ls:*)",
+      "Bash(xargs cat:*)",
+      "Bash(ls -lh /Users/uu/Projects/PentAGI/backend/pkg/providers/*.go)",
+      "Read(//Users/uu/Projects/detect/**)",
+      "Bash(python3 -c ':*)"
     ]
   }
 }

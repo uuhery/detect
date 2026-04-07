@@ -33,6 +33,11 @@ from switch_audit.prompts import (
     load_system_prompt,
 )
 from switch_audit.tools import ssh_exec
+from switch_audit.tools.crypto import decode_type7
+
+# Type 7 密文正则：匹配 "password 7 <hex>" 和 "key 7 <hex>"
+# 捕获组 1 = 完整匹配行片段，捕获组 2 = 纯密文部分
+_TYPE7_RE = re.compile(r"((?:password|key)\s+7\s+([0-9A-Fa-f]{4,}))")
 
 _llm = ChatOpenAI(
     model=settings.DEFAULT_LLM_MODEL,
@@ -352,7 +357,30 @@ def _build_analyze_context(state: AuditState) -> str:
     else:
         uncovered_section = "## Uncovered reconnaissance areas\n  (all checklist commands have been executed)"
 
-    return "\n\n".join([latest_section, facts_section, chains_section, id_hint, uncovered_section])
+    # 段六：预计算解码（纯算法，结果注入作为 ground truth）
+    precomputed = _precompute(latest["output"])
+
+    return "\n\n".join([latest_section, facts_section, chains_section, id_hint, uncovered_section]) + precomputed
+
+
+def _precompute(command_output: str) -> str:
+    """对命令输出做算法精确计算，结果拼接到 analyze 上下文末尾。
+
+    当前支持：Cisco Type 7 密码解码。
+    结果标记为 ground truth，LLM 写 Fact 时应直接引用解码后的明文。
+    """
+    lines = []
+    for m in _TYPE7_RE.finditer(command_output):
+        plaintext = decode_type7(m.group(2))
+        lines.append(f"  {m.group(1)}  →  plaintext: {plaintext}")
+    if not lines:
+        return ""
+    return (
+        "\n\n## Pre-decoded Values (algorithmically verified — treat as ground truth)\n"
+        "Type 7 passwords in the output above have been decoded. "
+        "When creating Facts about these passwords, include the plaintext in `content`.\n"
+        + "\n".join(lines)
+    )
 
 
 def _parse_analyze_response(raw: str, current_trial: int) -> tuple[list, list, str]:
@@ -645,6 +673,16 @@ def analyze(state: AuditState) -> dict:
         updates=chain_updates,
     )
 
+    # 代码层清理：从所有链的 verification_needed 中移除已执行命令。
+    # LLM 只在更新链时才会清空 verification_needed；若本轮未更新某条链，
+    # 其 verification_needed 会残留已执行命令，导致 next_probes 重复推荐。
+    executed_set = set(state.get("executed_commands", []))
+    for chain in updated_chains:
+        chain["verification_needed"] = [
+            cmd for cmd in chain.get("verification_needed", [])
+            if cmd not in executed_set
+        ]
+
     # 重算 next_probes（基于最新的 attack_chains 和 executed_commands）
     updated_probes = _compute_next_probes(
         attack_chains=updated_chains,
@@ -676,6 +714,58 @@ def analyze(state: AuditState) -> dict:
 
 # ── severity 排序权重（report 节点使用） ────────────────────────────────────
 _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+_ENABLE_CTX_RE = re.compile(r"^enable\s+(password|secret)\s+7\s+", re.IGNORECASE)
+_USERNAME_CTX_RE = re.compile(r"^username\s+(\S+)(?:\s+privilege\s+(\d+))?", re.IGNORECASE)
+
+
+def _infer_account_context(line: str) -> str:
+    """从包含 Type 7 密码的完整配置行推断账号/用途描述。"""
+    stripped = line.strip()
+    m = _ENABLE_CTX_RE.match(stripped)
+    if m:
+        return f"enable {m.group(1)}"
+    m = _USERNAME_CTX_RE.match(stripped)
+    if m:
+        name = m.group(1)
+        priv = m.group(2)
+        return f"username {name}" + (f" (privilege {priv})" if priv else "")
+    if re.search(r"\bkey\s+7\b", stripped, re.IGNORECASE):
+        return "Shared key (TACACS+/RADIUS)"
+    return "(unknown)"
+
+
+def _extract_decoded_credentials(command_history: list) -> list[dict]:
+    """从全部命令历史中提取并解码所有 Type 7 密码，附带账号上下文。
+
+    逐行扫描：用完整配置行推断账号类型（enable / username / shared key）。
+    纯算法，不依赖 LLM 产出的 Fact。
+
+    返回列表元素：
+      ciphertext    — 原始密文
+      plaintext     — 解码明文
+      account       — 账号/用途描述（如 "enable password"、"username admin (privilege 15)"）
+      source_command — 产生该输出的命令
+    """
+    results: list[dict] = []
+    seen_ciphertexts: set[str] = set()
+    for record in command_history:
+        for line in record.get("output", "").splitlines():
+            m = _TYPE7_RE.search(line)
+            if not m:
+                continue
+            ciphertext = m.group(2)
+            if ciphertext in seen_ciphertexts:
+                continue
+            seen_ciphertexts.add(ciphertext)
+            results.append({
+                "ciphertext": ciphertext,
+                "plaintext": decode_type7(ciphertext),
+                "account": _infer_account_context(line),
+                "source_command": record.get("command", ""),
+            })
+    return results
 
 
 def _render_chain(chain: dict, facts_by_id: dict) -> str:
@@ -792,6 +882,27 @@ def report(state: AuditState) -> dict:
         f"",
         f"---",
         f"",
+    ]
+
+    # ── 可用凭证区块（纯算法解码，独立于 LLM Fact） ──────────────────────────
+    decoded_creds = _extract_decoded_credentials(state.get("command_history", []))
+    if decoded_creds:
+        sections += [
+            f"## Recovered Credentials",
+            f"",
+            f"> **Note**: Type 7 is NOT encryption. "
+            f"Any attacker with config access can decode these instantly.",
+            f"",
+            f"| Account / Context | Plaintext | Ciphertext | Found In |",
+            f"|-------------------|-----------|------------|----------|",
+        ]
+        for c in decoded_creds:
+            sections.append(
+                f"| {c['account']} | `{c['plaintext']}` | `{c['ciphertext']}` | `{c['source_command']}` |"
+            )
+        sections += [f"", f"---", f""]
+
+    sections += [
         f"## Attack Chains",
         f"",
     ]
@@ -820,7 +931,7 @@ def report(state: AuditState) -> dict:
     report_text = "\n".join(sections) + "\n"
 
     # ── 写入磁盘 ────────────────────────────────────────────────────────────
-    reports_dir = Path(__file__).parent.parent.parent.parent / "reports"
+    reports_dir = Path(__file__).parent.parent.parent.parent.parent / "reports"
     reports_dir.mkdir(exist_ok=True)
     safe_target = target.replace(".", "_").replace(":", "_")
     filename = f"{safe_target}_{session_id[:8]}.md"
