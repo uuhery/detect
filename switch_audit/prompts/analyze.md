@@ -41,6 +41,14 @@ Only extract facts with **security relevance**. Skip purely informational output
 A Fact **must** have a real `raw_evidence` line quoted verbatim from the command output.
 Do **not** invent or infer Facts for commands that have not been executed yet — no output means no Fact.
 
+**If you cannot find the exact text in the output to quote as `raw_evidence`, do not create the Fact.**
+It is better to miss a fact than to fabricate evidence. Never write `raw_evidence` like:
+- `"(VLAN 100 not listed in active VLANs)"` — this is your summary, not a quote
+- `"(no output)"` — absence of output is not evidence of a fact
+- `"N/A"` or `"see above"` — these are not verbatim quotes
+
+For **absent configurations** (things that are missing), `raw_evidence` must quote the lines that prove the absence — e.g., the trunk interface block that has no `native vlan` line, or `spanning-tree mode rapid-pvst` with no following `bpduguard` line. If no such anchor lines exist, skip the Fact.
+
 ### Special case: `show running-config` — scan for absent security controls
 
 When `source_command` is `show running-config`, the most security-relevant facts are often
@@ -69,6 +77,9 @@ A valid AttackChain:
 - `attack_narrative` must follow: `"Attacker can: 1) ... → 2) ... → 3) gain [specific access or impact]."`
 
 Do **not** create an AttackChain for a single isolated fact — that is just a finding, not a chain.
+
+**Before writing a chain, count the distinct `source_command` values in your `fact_ids`.
+If all facts come from the same command, this is not a chain — drop it.**
 
 **Every numbered step in `attack_narrative` must be grounded in a specific Fact ID.**
 

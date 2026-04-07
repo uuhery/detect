@@ -40,9 +40,20 @@ _llm = ChatOpenAI(
     base_url=settings.OPENAI_BASE_URL,
 )
 
+# 必跑命令：无论模型选择什么，这两条必须在前两个 trial 完成。
+# 原因：show version 提供设备身份（device_os），show running-config 提供最高密度的配置信息。
+# 所有后续分析都依赖这两条的输出，缺失则 analyze 无法推断任何有意义的攻击链。
+_MANDATORY_COMMANDS: Final[list[str]] = [
+    "show version",
+    "show running-config",
+]
+
 # 从知识库加载命令全集（SSOT：与注入进 prompt 的命令列表完全一致）
 # all_valid_commands() 有 lru_cache，只读一次 YAML。
-_RECON_CHECKLIST: Final[list[str]] = all_valid_commands()
+# 必跑命令排在前面，保证 think 优先选择它们。
+_RECON_CHECKLIST: Final[list[str]] = _MANDATORY_COMMANDS + [
+    c for c in all_valid_commands() if c not in _MANDATORY_COMMANDS
+]
 
 # think() 构建上下文时最多使用最近 N 条命令记录（Iter 4 引入摘要前的临时限制）
 _CONTEXT_WINDOW_RECENT = 6
@@ -62,7 +73,10 @@ def _build_think_context(state: AuditState) -> str:
     executed: list[str] = state.get("executed_commands", [])
     next_probes: list[str] = state.get("next_probes", [])
 
-    # 剩余清单 = 临时清单 - 已执行（Iter 3 后替换为动态计划）
+    # 未跑的必跑命令（最高优先级，早于 next_probes）
+    mandatory_pending = [c for c in _MANDATORY_COMMANDS if c not in executed]
+
+    # 剩余清单 = 知识库全集 - 已执行
     remaining = [c for c in _RECON_CHECKLIST if c not in executed]
 
     # 已执行命令
@@ -70,12 +84,23 @@ def _build_think_context(state: AuditState) -> str:
         "\n".join(f"  - {c}" for c in executed) if executed else "  (none yet)"
     )
 
-    # 调查优先级：
-    # 1. next_probes（来自 attack_chains.verification_needed，Iter 2 后有内容）
-    # 2. 剩余清单（Iter 0 脚手架）
-    if next_probes:
+    # 调查优先级（三级）：
+    # 1. 必跑命令（未执行时最高优先）
+    # 2. next_probes（来自 attack_chains.verification_needed）
+    # 3. 剩余知识库命令
+    if mandatory_pending:
         guidance_section = (
-            "## Priority: run ONE of these next (NOT yet executed — needed to verify attack chain hypotheses):\n"
+            "## MANDATORY — run ONE of these first (required baseline, not yet executed):\n"
+            + "\n".join(f"  - {c}" for c in mandatory_pending)
+            + (
+                "\n\n## After mandatory commands, these are next (attack chain verification):\n"
+                + "\n".join(f"  - {p}" for p in next_probes)
+                if next_probes else ""
+            )
+        )
+    elif next_probes:
+        guidance_section = (
+            "## Priority: run ONE of these next (needed to verify attack chain hypotheses):\n"
             + "\n".join(f"  - {p}" for p in next_probes)
             + "\n\n## Also uncovered (lower priority):\n"
             + ("\n".join(f"  - {c}" for c in remaining) if remaining else "  (all covered)")
