@@ -47,7 +47,7 @@ def render_kb_section() -> str:
       - `show running-config` — 完整运行配置，最高信息密度来源
     """
     lines: list[str] = [
-        "## IOS XE Command Knowledge Base",
+        "## Command Knowledge Base",
         "",
         "以下是所有合法的只读审计命令，按功能分类。",
         "**你只能使用此列表中的命令**，不得使用未列出的命令。",
