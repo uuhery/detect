@@ -9,3 +9,8 @@ logs/
 .ruff_cache/
 dist/
 *.egg-info/
+
+# Containerlab
+clab-*/
+*.tar
+get-docker.sh

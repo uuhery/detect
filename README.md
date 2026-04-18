@@ -110,6 +110,54 @@ switch_audit/
     └── __init__.py             # ssh_exec（netmiko 封装）
 ```
 
+## 本地实验环境（Containerlab + OrbStack）
+
+在 Mac 上使用 OrbStack + Containerlab 搭建 Arista cEOS 靶机进行本地测试。
+
+### 前置条件
+
+- Mac 已安装 [OrbStack](https://orbstack.dev/)
+- ContainerLab 安装在 OrbStack 虚拟机内
+- 已拉取 Arista cEOS 镜像（`ceos:4.32.10M`）
+
+### 启动靶机
+
+SSH 进入 OrbStack 虚拟机后部署拓扑：
+
+```bash
+ssh orb
+cd /path/to/detect
+sudo containerlab deploy -t topo.yaml
+```
+
+### 运行审计
+
+回到 Mac 终端，直接执行：
+
+```bash
+./audit.sh
+```
+
+脚本会自动检测 SSH 隧道是否已开启，未开启则自动建立，然后对本地靶机（`localhost:2222`）发起审计。
+
+### .env 本地靶机配置
+
+```env
+SSH_PORT=2222
+SSH_USERNAME=admin
+SSH_PASSWORD=admin
+SSH_DEVICE_TYPE=arista_eos
+```
+
+### 销毁实验环境
+
+```bash
+ssh orb
+sudo containerlab destroy -t topo.yaml
+```
+
+---
+
 ## 可选：LangSmith 追踪
 
 开启后可在 [smith.langchain.com](https://smith.langchain.com) 查看每轮推理的完整链路：

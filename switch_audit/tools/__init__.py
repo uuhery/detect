@@ -38,6 +38,7 @@ def ssh_exec(
         "timeout": timeout,
         "conn_timeout": timeout,
         "fast_cli": False,  # 关闭快速模式，提高稳定性
+        "use_keys": False,  # 空密码时禁止自动回退到密钥认证
     }
     try:
         with ConnectHandler(**device) as conn:
