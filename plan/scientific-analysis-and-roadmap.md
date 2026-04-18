@@ -11,11 +11,13 @@
 
 你的 Fact 结构有三个硬约束：
 
-| 约束 | 作用 |
-|------|------|
-| `raw_evidence` 必须逐字引自命令输出 | 防止 LLM 幻觉出不存在的发现 |
-| `source_command` 单命令归因 | 每个 Fact 可溯源，人工复核路径完整 |
-| ≥2 个不同 `source_command` 才能构成 AttackChain | 防止单一命令的误报传导到链级别 |
+
+| 约束                                       | 作用                   |
+| ---------------------------------------- | -------------------- |
+| `raw_evidence` 必须逐字引自命令输出                | 防止 LLM 幻觉出不存在的发现     |
+| `source_command` 单命令归因                   | 每个 Fact 可溯源，人工复核路径完整 |
+| ≥2 个不同 `source_command` 才能构成 AttackChain | 防止单一命令的误报传导到链级别      |
+
 
 PentAGI 的 Pentester 没有这套机制。它的发现是 LLM 从对话历史中"认为自己看到的"——在长会话中存在误忆和混淆风险。
 
@@ -61,6 +63,7 @@ PentAGI 的等价信息散落在 `msglogs` 的自然语言文本里，无法程�
 ### 2.1 "Confirmed" 是被动确认，不是攻击确认
 
 当前语义：
+
 ```
 confidence = "confirmed"
   含义：所有 Fact 直接从设备输出读取，verification_needed = []
@@ -108,17 +111,19 @@ T=20 时可控；扩展到 60-100 trial，成本变成 9-25 倍。
 
 ## 三、综合评分
 
-| 维度 | 你的设计 | PentAGI | 备注 |
-|------|---------|---------|------|
-| 证据质量（不可篡改性） | ★★★★★ | ★★★☆☆ | raw_evidence 约束是核心优势 |
-| 被动侦查精度 | ★★★★☆ | ★★★☆☆ | Chain + Fact 结构减少误报 |
-| 主动攻击确认 | ★☆☆☆☆ | ★★★★★ | 你目前完全没有 |
-| 动态规划能力 | ★★☆☆☆ | ★★★★☆ | 静态列表 vs Refiner |
-| 可解释性/可审计 | ★★★★★ | ★★☆☆☆ | 溯源链完整 |
-| 矛盾证据处理 | ★★☆☆☆ | ★★★☆☆ | 单调假设有理论缺陷 |
-| 扩展性（trial>50） | ★★☆☆☆ | ★★★★☆ | Token 二次增长 |
-| 设备兼容性 | ★☆☆☆☆ | ★★★★☆ | 知识硬编码 vs LLM 通用知识 |
-| 工具多样性 | ★★☆☆☆ | ★★★★★ | SSH show 命令 vs 50+ 工具 |
+
+| 维度            | 你的设计  | PentAGI | 备注                    |
+| ------------- | ----- | ------- | --------------------- |
+| 证据质量（不可篡改性）   | ★★★★★ | ★★★☆☆   | raw_evidence 约束是核心优势  |
+| 被动侦查精度        | ★★★★☆ | ★★★☆☆   | Chain + Fact 结构减少误报   |
+| 主动攻击确认        | ★☆☆☆☆ | ★★★★★   | 你目前完全没有               |
+| 动态规划能力        | ★★☆☆☆ | ★★★★☆   | 静态列表 vs Refiner       |
+| 可解释性/可审计      | ★★★★★ | ★★☆☆☆   | 溯源链完整                 |
+| 矛盾证据处理        | ★★☆☆☆ | ★★★☆☆   | 单调假设有理论缺陷             |
+| 扩展性（trial>50） | ★★☆☆☆ | ★★★★☆   | Token 二次增长            |
+| 设备兼容性         | ★☆☆☆☆ | ★★★★☆   | 知识硬编码 vs LLM 通用知识     |
+| 工具多样性         | ★★☆☆☆ | ★★★★★   | SSH show 命令 vs 50+ 工具 |
+
 
 **理想架构**：你的 Fact/Chain/Evidence 结构 + PentAGI 的主动验证工具 + 解耦的可组装知识层。
 
@@ -149,6 +154,7 @@ T=20 时可控；扩展到 60-100 trial，成本变成 9-25 倍。
 ```
 
 **核心原则**：
+
 - Layer 1 里没有任何设备名称、命令名称、协议名称
 - Layer 2 可以是 Cisco IOS XE 的向量库，也可以是 Juniper JunOS 的，或者混合的
 - Layer 3 的工具是通用的（HTTP 登录对任何设备都一样），不是设备专属的
@@ -180,7 +186,7 @@ Phase 1 → Phase 2 → Phase 3 是模型能力提升驱动的自然演进，不
 
 1. 在 `switch_audit/tools/crypto.py` 实现 `decode_type7(ciphertext: str) -> str`
 2. 在 `analyze` 节点的 `_build_analyze_context` 里加 `_precompute` 调用：
-   ```python
+  ```python
    def _precompute(command_output: str) -> str:
        """纯算法计算，结果注入 LLM 上下文作为 ground truth。"""
        lines = []
@@ -190,11 +196,12 @@ Phase 1 → Phase 2 → Phase 3 是模型能力提升驱动的自然演进，不
        if lines:
            return "\n\n## Pre-decoded (algorithmically verified, treat as ground truth):\n" + "\n".join(lines)
        return ""
-   ```
+  ```
 3. LLM 在分析时看到解码结果，可以直接在 Fact 里写明文密码，AttackChain 的 confidence 据此更新
 4. 在 `report` 节点加"可用凭证"专属区块
 
 **验证**：
+
 - 用已知明文对照表验证算法正确性（离线）
 - 跑一次审计，看 Fact 里是否出现明文密码，Chain confidence 是否提升
 
@@ -326,6 +333,7 @@ If the last command returned `% Invalid input`, `% Ambiguous command`, or ssh_er
 analyze 节点发现 dynamic_probe 命令产生了有效 Fact 后，自动写入向量库（标记为"待 review"）。
 
 **验证**：
+
 - 同一目标，关闭 RAG（用固定列表）vs 开启 RAG，比较 trial 利用率和 Fact 质量
 - 换一台路由器（不同 device_type），验证向量库能返回相关但不同的命令
 - 验证错误命令后系统能自动换方向，不卡死
@@ -365,12 +373,14 @@ TOOL_REGISTRY = {
 **5c：verify 节点完全 LLM 驱动**
 
 verify 节点变成类似 PentAGI Pentester 的小型 ReAct agent：
+
 - 输入：confirmed AttackChains + TOOL_REGISTRY 的 function calling schema
 - LLM 自主决定用哪个工具，以什么参数
 - 上限：10 次工具调用
 - 结果写回 Fact + 更新 Chain confidence
 
 **验证**：
+
 - GNS3 完整流程：侦查 → RAG 辅助探测 → confirmed → verify（LLM 自选工具）→ `confirmed_exploited` → 报告
 - 换 device_type，验证知识库自动切换，逻辑层代码不改
 - 跑第二次同类审计，验证历史知识是否提升了 Fact 发现速度
@@ -401,3 +411,4 @@ Stage 5（工具注册表 + 知识积累） ← Stage 4 稳定后
 3. **verification_needed 驱动 next_probes**：RAG 检索和动态探测都是次级优先，confirmed chain 的 verification 始终最高优先
 4. **每次工具调用的理由显式记录**：verify 节点选工具的原因写进日志，不能是黑盒
 5. **Fact 只追加，不修改**：已写入的 Fact 是不可变的历史记录，confidence 变化只通过新 Fact + chain_patch 表达
+

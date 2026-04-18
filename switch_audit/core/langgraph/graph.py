@@ -31,7 +31,7 @@ from switch_audit.core.langgraph.state import AuditState
 from switch_audit.core.logging import logger
 
 # 每个会话的最大试验次数
-_MAX_TRIALS = 20
+_MAX_TRIALS = 8
 
 
 def _should_continue(state: AuditState) -> str:
