@@ -1,0 +1,256 @@
+"""
+DeviceAccessLayer: three-path abstraction over network device interfaces.
+
+Every path returns a CheckResult with data: dict — the rest of the system
+never receives raw CLI text. Paths tried in order until one succeeds:
+
+  1. NAPALM getter    — vendor SDK, structured objects, high confidence
+  2. ntc-templates    — TextFSM-parsed CLI output, medium confidence
+  3. ssh-raw          — raw CLI wrapped in {"raw": ...}, low confidence
+
+The caller only needs execute_check(). Path selection is automatic.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+from ntc_templates.parse import parse_output
+
+from switch_audit.core.config import settings
+from switch_audit.core.langgraph.state import AuditState, CheckResult
+from switch_audit.core.logging import logger
+from switch_audit.tools import ssh_exec
+
+logging.getLogger("napalm").setLevel(logging.WARNING)
+logging.getLogger("netmiko").setLevel(logging.WARNING)
+logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+_METHODOLOGY_PATH = Path(__file__).parent.parent / "knowledge" / "audit_methodology.yaml"
+
+# Canonical device_os → NAPALM driver name
+_NAPALM_DRIVERS: dict[str, str] = {
+    "cisco_iosxe": "ios",
+    "cisco_ios":   "ios",
+    "cisco_nxos":  "nxos",
+    "arista_eos":  "eos",
+    "juniper_junos": "junos",
+}
+
+# Canonical device_os → ntc-templates platform name
+_NTC_PLATFORMS: dict[str, str] = {
+    "cisco_iosxe":    "cisco_xe",
+    "cisco_ios":      "cisco_ios",
+    "cisco_nxos":     "cisco_nxos",
+    "arista_eos":     "arista_eos",
+    "juniper_junos":  "juniper_junos",
+}
+
+
+@lru_cache(maxsize=1)
+def load_methodology() -> list[dict]:
+    raw = yaml.safe_load(_METHODOLOGY_PATH.read_text(encoding="utf-8"))
+    return raw.get("checks", [])
+
+
+def get_check_spec(check_id: str) -> dict | None:
+    return next((c for c in load_methodology() if c["id"] == check_id), None)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def execute_check(check_id: str, state: AuditState) -> CheckResult:
+    """Execute one audit check, returning structured CheckResult on every path."""
+    check = get_check_spec(check_id)
+    if not check:
+        return CheckResult(
+            check_id=check_id,
+            data={},
+            access_method="unavailable",
+            confidence="low",
+            timestamp=_now(),
+        )
+
+    device_os = state.get("device_os", "")
+    access_method = state.get("access_method", "ssh-raw")
+
+    # Layer 1: NAPALM — only when profiler confirmed it works for this device
+    if check.get("napalm_getter") and access_method == "napalm":
+        result = _try_napalm(check, state, device_os)
+        if result:
+            return result
+
+    # Layer 2: ntc-templates — structured CLI parsing for known platforms
+    if check.get("parse_with") == "ntc-templates" and check.get("cli_fallback"):
+        result = _try_ntc_templates(check, state, device_os)
+        if result:
+            return result
+
+    # Layer 3: ssh-raw — always possible, data is low-confidence
+    if check.get("cli_fallback"):
+        return _ssh_raw(check, state)
+
+    return CheckResult(
+        check_id=check_id,
+        data={},
+        access_method="unavailable",
+        confidence="low",
+        timestamp=_now(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Layer implementations
+# ---------------------------------------------------------------------------
+
+def _try_napalm(check: dict, state: AuditState, device_os: str) -> CheckResult | None:
+    driver_name = _NAPALM_DRIVERS.get(device_os)
+    if not driver_name:
+        return None
+
+    try:
+        from napalm import get_network_driver  # lazy import — not required if NAPALM unavailable
+
+        driver_cls = get_network_driver(driver_name)
+        device = driver_cls(
+            hostname=state["target"],
+            username=settings.SSH_USERNAME,
+            password=settings.SSH_PASSWORD,
+            optional_args={
+                "port": settings.EAPI_PORT,
+                "transport": settings.EAPI_TRANSPORT,
+                "timeout": settings.SSH_TIMEOUT,
+            },
+        )
+        device.open()
+        try:
+            getter = getattr(device, check["napalm_getter"])
+            raw_data = getter()
+        finally:
+            device.close()
+
+        # NAPALM returns dict or list; list → {"rows": [...]} for uniform dict interface
+        data = raw_data if isinstance(raw_data, dict) else {"rows": raw_data}
+
+        logger.info("device_access.napalm_ok", check_id=check["id"])
+        return CheckResult(
+            check_id=check["id"],
+            data=data,
+            access_method="napalm",
+            confidence="high",
+            timestamp=_now(),
+        )
+
+    except Exception as exc:
+        logger.warning("device_access.napalm_failed", check_id=check["id"], error=str(exc))
+        return None
+
+
+def _try_ntc_templates(check: dict, state: AuditState, device_os: str) -> CheckResult | None:
+    platform = _NTC_PLATFORMS.get(device_os)
+    if not platform:
+        return None  # no template for this OS → fall through to ssh-raw
+
+    command = check["cli_fallback"]
+    raw = _ssh(state, command)
+    if raw.startswith("[ssh_error]"):
+        return None
+
+    try:
+        rows = parse_output(platform=platform, command=command, data=raw)
+        logger.info("device_access.ntc_ok", check_id=check["id"], rows=len(rows))
+        return CheckResult(
+            check_id=check["id"],
+            data={"rows": rows},
+            access_method="ntc-templates",
+            confidence="medium",
+            timestamp=_now(),
+        )
+    except Exception as exc:
+        logger.warning("device_access.ntc_failed", check_id=check["id"], error=str(exc))
+        return None
+
+
+def _ssh_raw(check: dict, state: AuditState) -> CheckResult:
+    command = check["cli_fallback"]
+    raw = _ssh(state, command)
+    status = "ssh_error" if raw.startswith("[ssh_error]") else "ok"
+    logger.info("device_access.ssh_raw", check_id=check["id"], status=status)
+    return CheckResult(
+        check_id=check["id"],
+        data={"raw": raw, "status": status},
+        access_method="ssh-raw",
+        confidence="low",
+        timestamp=_now(),
+    )
+
+
+def _ssh(state: AuditState, command: str) -> str:
+    return ssh_exec(
+        host=state["target"],
+        port=settings.SSH_PORT,
+        username=settings.SSH_USERNAME,
+        password=settings.SSH_PASSWORD,
+        command=command,
+        timeout=settings.SSH_TIMEOUT,
+        device_type=settings.SSH_DEVICE_TYPE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers used by profiler
+# ---------------------------------------------------------------------------
+
+def classify_device_os(raw_show_version: str) -> tuple[str, str]:
+    """Return (canonical_device_os, vendor) from raw 'show version' output."""
+    s = raw_show_version.lower()
+
+    if "ios xe" in s or "ios-xe" in s:
+        return "cisco_iosxe", "Cisco"
+    if "cisco ios" in s:
+        return "cisco_ios", "Cisco"
+    if "nx-os" in s or "nxos" in s:
+        return "cisco_nxos", "Cisco"
+    if "arista" in s or ("eos" in s and "arista" not in s and "junos" not in s):
+        return "arista_eos", "Arista"
+    if "junos" in s or "juniper" in s:
+        return "juniper_junos", "Juniper"
+    if "frr" in s or "free range routing" in s or "frrouting" in s:
+        return "frr", "FRR"
+    if "open vswitch" in s or "ovs" in s:
+        return "ovs", "OVS"
+    return "unknown", "Unknown"
+
+
+def probe_napalm(target: str, device_os: str) -> bool:
+    """Return True if a minimal NAPALM connection succeeds for this device."""
+    driver_name = _NAPALM_DRIVERS.get(device_os)
+    if not driver_name:
+        return False
+    try:
+        from napalm import get_network_driver
+        device = get_network_driver(driver_name)(
+            hostname=target,
+            username=settings.SSH_USERNAME,
+            password=settings.SSH_PASSWORD,
+            optional_args={
+                "port": settings.EAPI_PORT,
+                "transport": settings.EAPI_TRANSPORT,
+                "timeout": 10,
+            },
+        )
+        device.open()
+        device.close()
+        return True
+    except Exception:
+        return False

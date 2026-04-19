@@ -9,6 +9,7 @@ logs/
 .ruff_cache/
 dist/
 *.egg-info/
+reports/
 
 # Containerlab
 clab-*/

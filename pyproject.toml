@@ -14,6 +14,10 @@ dependencies = [
     "pydantic-settings>=2.8.0",
     "python-dotenv>=1.1.0",
     "structlog>=25.0.0",
+    "napalm>=5.0.0",           # structured vendor-agnostic device getters
+    "ntc-templates>=7.0.0",    # TextFSM parsers for CLI output (300+ commands)
+    "pyyaml>=6.0.0",           # audit_methodology.yaml loading
+    "chromadb>=0.6.0",         # persistent vector memory for cross-session learning
 ]
 
 [dependency-groups]

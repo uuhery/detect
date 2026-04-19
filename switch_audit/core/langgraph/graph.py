@@ -1,70 +1,75 @@
-"""LangGraph 审计工作流程。
+"""
+Audit graph topology — Phase 1 + memory layer.
 
-图拓扑（Iter 2）：
+Flow:
+  START → profiler → search_memory → adviser → executor → analyze → store_success → _route
+                                                                                  → adviser (loop)
+                                                                                  └→ report → END
 
-[开始]
-   │
-思考 ──── 生成 reasoning + proposed_command
-   │
-行动 ──── 执行命令，写入 CommandRecord
-   │
-分析 ──── 提取 Facts，推断 AttackChains，更新 next_probes
-   │
-是否继续？
-   ├── "思考"（循环返回）
-   └── 结束
-
-路由函数从 act 后移到 analyze 后：
-  act → analyze 用直连 edge（analyze 内部处理 skipped_duplicate 的跳过逻辑）。
-  路由判断依赖 trial_count（act 写入）和 status（不变），analyze 不修改这两个字段。
-  路由函数与 Iter 1 完全相同，只是调用位置从 act 后变为 analyze 后。
-
-内存检查点：每个状态转换都在内存中持久化，支持 graph.get_state() / graph.update_state() 时间旅行。
+profiler       runs every iteration but returns {} after the first (idempotent).
+search_memory  queries ChromaDB for prior findings; populates enriched_strategy (runs once).
+adviser        picks the next pending check_id (sequential in Phase 1).
+executor       runs the check via DeviceAccessLayer; always returns a CheckResult.
+analyze        extracts Facts and updates AttackChains from the latest CheckResult.
+store_success  persists new Facts and confirmed chains back to ChromaDB.
+_route         loops to adviser while pending_checks remain; otherwise goes to report.
+report         writes the Markdown report and marks status = "completed".
 """
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from switch_audit.core.langgraph.nodes import act, analyze, report, think
+from switch_audit.core.langgraph.nodes import (
+    adviser,
+    analyze,
+    executor,
+    profiler,
+    report,
+    search_memory,
+    store_success,
+)
 from switch_audit.core.langgraph.state import AuditState
 from switch_audit.core.logging import logger
 
-# 每个会话的最大试验次数
-_MAX_TRIALS = 8
+_MAX_TRIALS = 12  # safety ceiling; methodology has 10 checks, allow headroom
 
 
-def _should_continue(state: AuditState) -> str:
-    """路由函数：决定是否继续探测或进入报告阶段。"""
+def _route(state: AuditState) -> str:
+    """Route after store_success: loop to adviser or terminate to report."""
     if state["status"] != "running":
         return "report"
-    if state["trial_count"] >= _MAX_TRIALS:
-        logger.info("audit.max_trials_reached", trials=state["trial_count"])
+    if not state.get("pending_checks"):
+        logger.info("graph.route.all_checks_done", trials=state["trial_count"])
         return "report"
-    return "think"
+    if state["trial_count"] >= _MAX_TRIALS:
+        logger.info("graph.route.max_trials", trials=state["trial_count"])
+        return "report"
+    return "adviser"
 
 
 def build_graph() -> CompiledStateGraph:
-    """构建并编译审计图（Iter 3：think → act → analyze 循环，结束后 → report → END）。"""
     builder = StateGraph(AuditState)
 
-    builder.add_node("think", think)
-    builder.add_node("act", act)
+    builder.add_node("profiler", profiler)
+    builder.add_node("search_memory", search_memory)
+    builder.add_node("adviser", adviser)
+    builder.add_node("executor", executor)
     builder.add_node("analyze", analyze)
-    builder.add_node("report", report)             # 审计结束后生成报告
+    builder.add_node("store_success", store_success)
+    builder.add_node("report", report)
 
-    builder.add_edge(START, "think")
-    builder.add_edge("think", "act")
-    builder.add_edge("act", "analyze")
+    builder.add_edge(START, "profiler")
+    builder.add_edge("profiler", "search_memory")
+    builder.add_edge("search_memory", "adviser")
+    builder.add_edge("adviser", "executor")
+    builder.add_edge("executor", "analyze")
+    builder.add_edge("analyze", "store_success")
     builder.add_conditional_edges(
-        "analyze",
-        _should_continue,
-        {"think": "think", "report": "report"},
+        "store_success", _route, {"adviser": "adviser", "report": "report"}
     )
-    builder.add_edge("report", END)                # report 是终点
+    builder.add_edge("report", END)
 
-    checkpointer = MemorySaver()
-    graph = builder.compile(checkpointer=checkpointer, name="switch-audit")
-
-    logger.info("graph.built", nodes=["think", "act", "analyze", "report"], max_trials=_MAX_TRIALS)
+    graph = builder.compile(checkpointer=MemorySaver(), name="switch-audit-v2")
+    logger.info("graph.built", max_trials=_MAX_TRIALS)
     return graph

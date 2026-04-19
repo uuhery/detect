@@ -1,160 +1,117 @@
 """
-交换机漏洞审计图的状态模式。
+AuditState: the single source of truth for one audit session.
 
-核心目标：发现"跨多条命令输出才能推断的复合漏洞攻击链"。
-状态的每个字段都服务于这个目标，或服务于让 Agent 循环可靠运行。
+Design principles:
+  1. Every field has exactly one writer — noted in the docstring.
+  2. Structured data only — no raw CLI text in analysis fields.
+  3. Minimal surface — no ephemeral scratchpad fields in the persisted state.
 
-设计原则：
-  1. 状态即审计日志 — 每个字段是可审计的一等事实，不存在调试字符串
-  2. 结构先于文本 — 能用 TypedDict 表达的不用 str
-  3. 推理与行动分离 — reasoning (why) 和 proposed_command (what) 是独立字段
-  4. Fact 是原子，AttackChain 是分子 — 复合链由 ≥2 个独立事实组合推断
-
-节点与字段的读写关系：
-  think()   读: command_history(recent), executed_commands, attack_chains,
-                next_probes, device_os, trial_count
-            写: reasoning, proposed_command
-
-  act()     读: proposed_command, executed_commands
-            写: command_history(append), executed_commands(append), trial_count(+1)
-
-  analyze() 读: command_history[-1], facts, attack_chains, device_os   [Iter 2]
-            写: facts(append), attack_chains(upsert), next_probes, device_os
+Node read/write contract:
+  profiler()  writes: device_os, device_vendor, access_method,
+                      pending_checks, completed_checks, check_results (empty)
+  adviser()   writes: proposed_check_id
+  executor()  writes: check_results (append), pending_checks (pop), completed_checks (append),
+                      trial_count (+1)
+  analyze()   writes: facts (append), attack_chains (upsert)
+  report()    writes: status ("completed"), report_path
 """
 
-from typing import Annotated
-
-from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
 
-class CommandRecord(TypedDict):
-    """单次命令执行的完整记录。只追加，不修改。
+# ---------------------------------------------------------------------------
+# Evidence unit — what executor produces
+# ---------------------------------------------------------------------------
 
-    存在理由：
-      替代原 observations: list[str]。
-      analyze 节点需要知道"哪个命令产生了哪段输出"才能正确归因 Fact。
-      status 字段让 think 节点知道某命令是否失败，避免重试失败路径。
+class CheckResult(TypedDict):
+    """Structured evidence from one audit check.
 
-    不变量：trial 与 command_history 的下标一一对应。
+    'data' is always a dict, never raw text.
+      - NAPALM path:        data = the getter's return value (already a dict/list → wrapped)
+      - ntc-templates path: data = {"rows": [<parsed dicts>]}
+      - ssh-raw path:       data = {"raw": "<output>", "status": "ok"|"ssh_error"}
+
+    'access_method' + 'confidence' record how reliably the data was obtained,
+    letting analyze() weight evidence appropriately.
     """
-    trial: int
-    command: str
-    output: str    # 原始输出，不截断
-    status: str    # "ok" | "ssh_error" | "skipped_duplicate"
-    timestamp: str # ISO 8601，UTC
+    check_id: str
+    data: dict
+    access_method: str   # "napalm" | "ntc-templates" | "ssh-raw" | "unavailable"
+    confidence: str      # "high" | "medium" | "low"
+    timestamp: str       # ISO 8601 UTC
 
+
+# ---------------------------------------------------------------------------
+# Analysis units — what analyze() produces
+# ---------------------------------------------------------------------------
 
 class Fact(TypedDict):
-    """从单条命令输出中提取的一个安全相关事实。
+    """One atomic security-relevant observation from a single check result.
 
-    存在理由：
-      Facts 是 AttackChain 的原子构成单元。
-      analyze 节点每次只读最新命令的输出，但要与历史事实关联，
-      把历史输出全部重新送入 LLM 代价太高。
-      facts 列表提供所有历史事实的结构化摘要，是跨命令关联推理的桥梁。
-
-    设计约束：
-      一个 Fact 只陈述一件事，来自一条命令，content 一句话。
-      单独看通常是 low/medium 危险度，多个组合才能构成 high/critical 攻击链。
+    Atomic means: one condition, one source, one sentence.
+    Facts are the raw material for AttackChain construction.
     """
-    id: str             # "f{trial}-{index}"，全局唯一，用于被 AttackChain 引用
-    trial: int          # 从哪一轮的命令输出中提取
-    source_command: str # 来源命令，用于人工复核时追溯
-    content: str        # 一句话陈述，e.g. "HTTP 管理界面在端口 80 开放，无 IP ACL 限制"
-    raw_evidence: str   # 原始文本中支撑该事实的片段（≤3 行），供人工验证
+    id: str              # "f{trial}-{index}", globally unique
+    trial: int           # which executor trial produced the source CheckResult
+    source_check: str    # check_id of the CheckResult this fact came from
+    content: str         # one-sentence observation; no inference, no impact assessment
+    raw_evidence: str    # verbatim excerpt from check_result.data proving this fact
 
 
 class AttackChain(TypedDict):
-    """跨多条命令输出推断出的复合漏洞攻击链。
+    """A multi-step exploitable path inferred from ≥2 facts from ≥2 different checks.
 
-    存在理由（核心）：
-      这是 Agent 区别于规则系统的关键产出。
-      规则系统每条规则独立匹配，只能报告单个 Fact。
-      Agent 能发现需要 ≥2 个 Fact 同时为真才能构成的可利用路径。
+    The core value of an AI audit agent over a rule engine:
+    rules fire on individual facts; this captures cross-check compound paths.
 
-      例：
-        Fact A: "enable password 使用 Type 7 编码（可逆）"          来自 show running-config
-        Fact B: "HTTP 管理界面使用 enable 密码认证，无 IP ACL"     来自 show ip http server status
-        → 规则系统：两条独立 finding（low + medium）
-        → AttackChain：一条 high severity 的完整攻击路径
-
-    severity 语义：
-      基于整条链的可利用性，而非单个 Fact 的严重度。
-      两个 low Fact 的组合可能产生 high 的 AttackChain。
-
-    confidence 驱动 next_probes：
-      "speculative" → verification_needed 里的命令会进入 next_probes
-      → think 节点优先执行这些命令 → 下一轮 analyze 提升 confidence
-      这是 Agent 的"目标导向探测"行为，区别于随机探索。
+    confidence drives the audit loop:
+      speculative/likely  → verification_needed check_ids are fed back to adviser
+      confirmed           → no further probing needed for this chain
     """
-    id: str                        # "c{trial}-{index}"，全局唯一
-    title: str                     # 一行标题，e.g. "可逆密码 → HTTP 管理员访问"
-    fact_ids: list[str]            # 构成此链的 Fact ID 列表（≥2 个才是复合链）
-    attack_narrative: str          # 攻击步骤："攻击者可以：1)... → 2)... → 3) 获得 X 权限"
-    severity: str                  # "critical" | "high" | "medium" | "low"
-    confidence: str                # "confirmed" | "likely" | "speculative"
-                                   # confirmed : 所有事实直接从设备输出读取
-                                   # likely    : 部分事实从间接证据推断
-                                   # speculative: 需要额外命令验证才能确认
-    verification_needed: list[str] # confidence != confirmed 时，这些命令能提升置信度
-    trial_first_seen: int          # 第一次推断出此链的 trial，用于分析"第几步发现了复合链"
+    id: str                         # "c{trial}-{index}", globally unique
+    title: str                      # one-line summary, e.g. "Weak password → HTTP admin access"
+    fact_ids: list[str]             # ≥2 Fact IDs spanning ≥2 source_check values
+    attack_narrative: str           # "Attacker can: 1) ... → 2) ... → 3) gain <impact>"
+    severity: str                   # "critical" | "high" | "medium" | "low"
+    confidence: str                 # "confirmed" | "likely" | "speculative" | "refuted"
+    verification_needed: list[str]  # check_ids that would raise confidence; [] when confirmed
+    trial_first_seen: int
 
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
 
 class AuditState(TypedDict):
-    # ── LangGraph managed ────────────────────────────────────────────────────
-    # add_messages 归约器：新消息追加，不替换。
-    # 当前阶段未充分利用（think 每次重建消息），Iter 4 记忆管理时会启用。
-    messages: Annotated[list, add_messages]
+    # ── Session identity (set at init, never modified) ──────────────────────
+    session_id: str   # LangGraph thread_id; enables checkpoint resume
+    target: str       # IP or hostname; immutable
+    started_at: str   # ISO 8601 UTC; used for audit window in report
 
-    # ── 会话标识 ─────────────────────────────────────────────────────────────
-    session_id: str  # LangGraph thread_id，支持 checkpoint 断点恢复
-    started_at: str  # ISO 8601 UTC。最终报告中标注审计时间窗口；计算审计耗时
+    # ── Device profile (written once by profiler) ────────────────────────────
+    device_os: str      # canonical OS token: "cisco_iosxe" | "frr" | "arista_eos" | ...
+    device_vendor: str  # human name: "Cisco" | "FRR" | "Arista" | "Unknown"
+    access_method: str  # "napalm" | "ntc-templates" | "ssh-raw"
+                        # determines which DeviceAccessLayer path executor uses
 
-    # ── 目标设备 ─────────────────────────────────────────────────────────────
-    target: str      # 用户提供的 IP / 主机名，不可变
+    # ── Audit plan (pending shrinks, completed grows; both written by executor) ─
+    pending_checks: list[str]    # check IDs not yet executed
+    completed_checks: list[str]  # check IDs executed (in order)
 
-    device_os: str   # 由 analyze 节点从 show version 输出中提取，初始为空字符串。
-                     # 存在理由：不同 OS 版本命令语法不同（IOS XE vs NX-OS vs IOS）；
-                     # 后期 Iter 6 中与 CVE 数据库关联时需要精确版本号。
-                     # e.g. "Cisco IOS XE 17.15.1 / C9KV-UADP-8P"
+    # ── Evidence (append-only, written by executor) ─────────────────────────
+    check_results: list[CheckResult]  # one entry per executed check; always structured
 
-    # ── 执行日志（只追加，不修改） ───────────────────────────────────────────
-    command_history: list[CommandRecord]  # 所有命令的结构化执行记录
-                                          # 替代原 observations: list[str]
-                                          # think 节点用最近 N 条构建上下文（避免全量送入 LLM）
+    # ── Analysis outputs (written by analyze) ───────────────────────────────
+    facts: list[Fact]
+    attack_chains: list[AttackChain]
 
-    executed_commands: list[str]  # 已执行命令的有序列表
-                                  # 与 command_history 冗余，但 act() 去重检查时需要 O(1) 查找
-                                  # 设计权衡：轻微冗余换取逻辑清晰
+    # ── Per-iteration handoff (adviser writes, executor reads) ───────────────
+    proposed_check_id: str
 
-    # ── 分析产物（由 analyze 节点填充，Iter 2 引入） ────────────────────────
-    facts: list[Fact]                # 从历次命令输出中提取的安全事实原子
-                                     # 是 analyze 节点跨命令关联推理的原材料
-                                     # Iter 1 阶段始终为空列表，Iter 2 后开始填充
+    # ── Memory enrichment (search_memory writes, adviser reads in Phase 2) ──
+    enriched_strategy: str  # historical findings summary from ChromaDB; "" if cold start
 
-    attack_chains: list[AttackChain] # 发现的复合攻击链
-                                     # Agent 的核心产出，区别于规则系统的关键字段
-                                     # Iter 1 阶段始终为空列表，Iter 2 后开始填充
-
-    # ── 调查引导（analyze → think 的反馈回路，Iter 2 引入） ─────────────────
-    next_probes: list[str]  # analyze 节点根据 attack_chains.verification_needed 汇总的
-                            # 高优先级下一步命令。think 节点优先从此列表选择。
-                            # 空时 think 节点自由探索（当前 Iter 1 行为）。
-                            # 这是 Agent"目标导向"的实现：发现不完整的链 → 主动验证它
-
-    # ── think 节点产物（think → act 之间传递） ──────────────────────────────
-    reasoning: str         # LLM 的推理过程：为什么选这个命令，期望发现什么
-                           # 替代原 hypothesis: str（hypothesis 把推理和行动混在一起）
-                           # 存在价值：可解释性；人工审阅时理解 Agent 的决策逻辑
-
-    proposed_command: str  # 下一步要执行的单条命令
-                           # 替代原来从 JSON blob hypothesis 中用 regex 解析 proposed_action
-                           # act() 直接读取，无需解析，消除了解析失败回退到 "id" 的脆弱性
-
-    # ── 报告（report 节点填充，审计结束时生成） ─────────────────────────────
-    report_path: str  # 生成的 Markdown 报告文件的绝对路径，空字符串表示尚未生成
-
-    # ── 控制 ─────────────────────────────────────────────────────────────────
+    # ── Control ─────────────────────────────────────────────────────────────
     trial_count: int
-    status: str  # "running" | "completed" | "error"
+    status: str      # "running" | "completed" | "error"
+    report_path: str

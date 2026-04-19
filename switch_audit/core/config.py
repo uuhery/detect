@@ -72,6 +72,10 @@ class Settings:
         # netmiko device_type: cisco_xe | cisco_ios | cisco_nxos | ...
         self.SSH_DEVICE_TYPE = os.getenv("SSH_DEVICE_TYPE", "cisco_xe")
 
+        # eAPI — NAPALM EOS driver (separate from SSH tunnel)
+        self.EAPI_PORT = int(os.getenv("EAPI_PORT", "443"))
+        self.EAPI_TRANSPORT = os.getenv("EAPI_TRANSPORT", "https")
+
         # Logging
         self.LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

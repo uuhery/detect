@@ -1,0 +1,92 @@
+# Audit methodology: WHAT to check, not HOW.
+#
+# Each check is a security goal. The HOW (which CLI command, which API call) is
+# resolved at runtime by DeviceAccessLayer based on what the target device supports.
+#
+# Fields:
+#   id              — stable identifier used everywhere (state, facts, attack chains)
+#   category        — grouping for reporting
+#   description     — human-readable check name
+#   napalm_getter   — NAPALM getter method name; null means no structured getter exists
+#   cli_fallback    — CLI command to run when NAPALM is unavailable
+#   parse_with      — "ntc-templates" to get structured rows; omit for ssh-raw
+#   security_relevance — one sentence explaining the security significance
+
+checks:
+  - id: device_identity
+    category: identity
+    description: Device facts (vendor, model, OS version, serial)
+    napalm_getter: get_facts
+    cli_fallback: "show version"
+    parse_with: ntc-templates
+    security_relevance: Confirms exact OS version for CVE matching; detects EOL software.
+
+  - id: running_config
+    category: identity
+    description: Full running configuration
+    napalm_getter: get_config
+    cli_fallback: "show running-config"
+    security_relevance: Highest-density source for absent security controls (banners, ACLs, timeouts, weak ciphers).
+
+  - id: local_accounts
+    category: access_auth
+    description: Local user accounts and privilege levels
+    napalm_getter: get_users
+    cli_fallback: "show running-config | section username"
+    security_relevance: Unnecessary privileged accounts extend the attack surface for credential-based lateral movement.
+
+  - id: snmp_config
+    category: management_protocols
+    description: SNMP community strings and version
+    napalm_getter: get_snmp_information
+    cli_fallback: "show snmp community"
+    parse_with: ntc-templates
+    security_relevance: SNMPv1/v2c community strings are cleartext and world-readable; default "public"/"private" strings are trivially guessable.
+
+  - id: lldp_neighbors
+    category: management_protocols
+    description: LLDP/CDP neighbor table (topology exposure)
+    napalm_getter: get_lldp_neighbors_detail
+    cli_fallback: "show lldp neighbors detail"
+    parse_with: ntc-templates
+    security_relevance: Discovery protocols leak device model, IP, and topology to any host on the segment.
+
+  - id: interface_status
+    category: interfaces
+    description: Interface IP addresses and operational state
+    napalm_getter: get_interfaces_ip
+    cli_fallback: "show ip interface brief"
+    parse_with: ntc-templates
+    security_relevance: Unused interfaces left in UP state are unsecured entry points.
+
+  - id: arp_table
+    category: layer2
+    description: ARP table entries
+    napalm_getter: get_arp_table
+    cli_fallback: "show ip arp"
+    parse_with: ntc-templates
+    security_relevance: Duplicate IP or unexpected MAC entries indicate ARP spoofing or rogue hosts.
+
+  - id: vlan_config
+    category: layer2
+    description: VLAN database and trunk port allowed VLANs
+    napalm_getter: null
+    cli_fallback: "show vlan brief"
+    parse_with: ntc-templates
+    security_relevance: Native VLAN 1 on trunks and unrestricted trunk allowed-VLANs enable VLAN-hopping attacks.
+
+  - id: spanning_tree
+    category: layer2
+    description: STP root bridge, port roles, and protection features
+    napalm_getter: null
+    cli_fallback: "show spanning-tree"
+    parse_with: ntc-templates
+    security_relevance: Unauthorized STP root-bridge election can redirect all traffic through an attacker-controlled switch.
+
+  - id: ssh_config
+    category: access_auth
+    description: SSH version and enabled cipher/MAC algorithms
+    napalm_getter: null
+    cli_fallback: "show ip ssh"
+    parse_with: ntc-templates
+    security_relevance: SSHv1 is cryptographically broken; weak ciphers expose management sessions to MITM.

@@ -1,27 +1,20 @@
 name: detect-audit-lab
 
+mgmt:
+  network: clab
+  ipv4-subnet: 172.20.20.0/24
+
 topology:
   nodes:
-    # 1. Arista 靶机
     sw-target:
       kind: arista_ceos
       image: ceos:4.32.10M
+      mgmt-ipv4: 172.20.20.2
       startup-config: |
-        username admin privilege 15 role network-admin nopassword
+        username admin privilege 15 role network-admin secret 0 admin
         management ssh
            no shutdown
         management api http-commands
            no shutdown
-
-    # 2. Agent 测试机 (待删除)
-    agent-host:
-      kind: linux
-      image: python:3.13-slim 
-      binds:
-        - .:/workspace
       exec:
-        - sh -c "cd /workspace && curl -LsSf https://astral.sh/uv/install.sh | sh"
-        - sh -c "cd /workspace && export PATH=\"$HOME/.cargo/bin:$PATH\" && uv sync"
-
-  links:
-    - endpoints: ["sw-target:eth1", "agent-host:eth1"]
+        - bash -c 'printf "configure\nmanagement api http-commands\nprotocol http\nno shutdown\n" | FastCli -p 15 -A'
