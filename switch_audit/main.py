@@ -46,6 +46,7 @@ def run_audit(target: str, session_id: str | None = None) -> None:
         "enriched_strategy": "",
         # Handoff (adviser writes)
         "proposed_check_id": "",
+        "adviser_reasoning": "",
         # Control
         "trial_count": 0,
         "status": "running",

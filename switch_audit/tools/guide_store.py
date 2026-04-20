@@ -29,17 +29,13 @@ def _get_collection():
         return _col
     try:
         import chromadb
-        from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-
-        from switch_audit.core.config import settings
+        from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
         _DB_PATH.mkdir(parents=True, exist_ok=True)
         client = chromadb.PersistentClient(path=str(_DB_PATH))
-        ef = OpenAIEmbeddingFunction(
-            api_key=settings.OPENAI_API_KEY,
-            model_name="text-embedding-3-small",
+        _col = client.get_or_create_collection(
+            _COLLECTION, embedding_function=DefaultEmbeddingFunction()
         )
-        _col = client.get_or_create_collection(_COLLECTION, embedding_function=ef)
         _log.info("guide_store.ready", path=str(_DB_PATH))
         return _col
     except Exception as exc:

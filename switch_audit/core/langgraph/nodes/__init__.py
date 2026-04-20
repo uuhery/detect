@@ -27,7 +27,7 @@ logging.getLogger("paramiko").setLevel(logging.WARNING)
 from switch_audit.core.config import settings
 from switch_audit.core.langgraph.state import AttackChain, AuditState, CheckResult, Fact
 from switch_audit.core.logging import logger
-from switch_audit.prompts import load_analyze_prompt
+from switch_audit.prompts import build_adviser_user_message, load_adviser_prompt, load_analyze_prompt
 from switch_audit.tools import ssh_exec
 from switch_audit.tools.crypto import decode_type7
 from switch_audit.tools.device_access import (
@@ -183,20 +183,54 @@ def store_success(state: AuditState) -> dict:
 # ---------------------------------------------------------------------------
 
 def adviser(state: AuditState) -> dict:
-    """Select the next audit check to execute.
+    """Select the next audit check using an LLM.
 
-    Phase 1: sequential — first item in pending_checks.
-    Phase 2: LLM-driven selection based on attack_chains.verification_needed
-             and ChromaDB enriched_strategy (not yet implemented).
+    Priority the LLM is instructed to follow:
+      1. Checks in attack_chains.verification_needed  — confirm/refute live chains first
+      2. Checks that historically yield findings       — from enriched_strategy (memory layer)
+      3. Sequential fallback                           — first item in pending_checks
+
+    Falls back to sequential selection if the LLM call fails or returns an invalid check_id,
+    so a broken LLM never stalls the audit.
     """
     pending = state.get("pending_checks", [])
     if not pending:
-        return {"proposed_check_id": ""}
+        return {"proposed_check_id": "", "adviser_reasoning": "all checks complete"}
 
-    # Phase 1: sequential order (methodology defines priority by position)
-    proposed = pending[0]
-    logger.info("node.adviser", proposed_check_id=proposed, remaining=len(pending))
-    return {"proposed_check_id": proposed}
+    try:
+        user_msg = build_adviser_user_message(state)
+        response = _llm.invoke([
+            {"role": "system", "content": load_adviser_prompt()},
+            {"role": "user", "content": user_msg},
+        ])
+
+        raw = response.content.strip()
+        # Strip markdown code fences if present
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+        data = json.loads(match.group(1) if match else raw)
+
+        check_id = data.get("check_id", "")
+        reasoning = data.get("reasoning", "")
+
+        if check_id not in pending:
+            logger.warning(
+                "node.adviser.invalid_id",
+                llm_returned=check_id,
+                fallback=pending[0],
+            )
+            check_id, reasoning = pending[0], f"[fallback: LLM returned invalid id] sequential"
+
+    except Exception as exc:
+        logger.warning("node.adviser.llm_failed", error=str(exc), fallback=pending[0])
+        check_id, reasoning = pending[0], "[fallback: LLM error] sequential"
+
+    logger.info(
+        "node.adviser",
+        proposed_check_id=check_id,
+        reasoning=reasoning,
+        remaining=len(pending),
+    )
+    return {"proposed_check_id": check_id, "adviser_reasoning": reasoning}
 
 
 # ---------------------------------------------------------------------------

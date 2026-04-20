@@ -107,6 +107,7 @@ class AuditState(TypedDict):
 
     # ── Per-iteration handoff (adviser writes, executor reads) ───────────────
     proposed_check_id: str
+    adviser_reasoning: str  # one-sentence explanation of why this check was chosen
 
     # ── Memory enrichment (search_memory writes, adviser reads in Phase 2) ──
     enriched_strategy: str  # historical findings summary from ChromaDB; "" if cold start
