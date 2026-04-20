@@ -232,6 +232,31 @@ def classify_device_os(raw_show_version: str) -> tuple[str, str]:
     return "unknown", "Unknown"
 
 
+def extract_version_string(raw_show_version: str, device_os: str) -> str:
+    """Extract a clean version string from 'show version' output for NVD CPE lookup.
+
+    Returns the version token (e.g. "4.28.3F", "17.03.01a") or "" if not found.
+    """
+    import re
+    patterns: dict[str, list[str]] = {
+        "arista_eos":    [
+            r"[Ss]oftware\s+image\s+version:\s+(\S+)",          # cEOS: "Software image version: 4.32.10M-..."
+            r"[Ee][Oo][Ss]\s+(?:version\s+)?(\d[\d.]+\w*)",     # physical: "EOS version 4.28.3F"
+        ],
+        "cisco_iosxe":   [r"[Cc]isco IOS.XE Software.*?[Vv]ersion\s+(\S+)", r"[Vv]ersion\s+(\d+\.\d+\.\S+)"],
+        "cisco_ios":     [r"[Cc]isco IOS Software.*?[Vv]ersion\s+(\S+,?)", r"[Vv]ersion\s+(\d+\.\d+[\(\)\w]+)"],
+        "cisco_nxos":    [r"[Nn][Xx]-[Oo][Ss].*?[Vv]ersion\s+(\S+)", r"[Vv]ersion\s+(\d+\.\d+\S*)"],
+        "juniper_junos": [r"[Jj]unos:\s+(\S+)", r"[Jj][Uu][Nn][Oo][Ss]\s+[Rr]elease\s+(\S+)"],
+        "frr":           [r"[Ff][Rr][Rr]outing\s+(\d[\d.]+)", r"[Ff][Rr][Rr]\s+(\d[\d.]+)"],
+    }
+    for pattern in patterns.get(device_os, []):
+        m = re.search(pattern, raw_show_version)
+        if m:
+            # Strip trailing comma/semicolon
+            return m.group(1).rstrip(",;")
+    return ""
+
+
 def probe_napalm(target: str, device_os: str) -> bool:
     """Return True if a minimal NAPALM connection succeeds for this device."""
     driver_name = _NAPALM_DRIVERS.get(device_os)

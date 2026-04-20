@@ -27,16 +27,18 @@ logging.getLogger("paramiko").setLevel(logging.WARNING)
 from switch_audit.core.config import settings
 from switch_audit.core.langgraph.state import AttackChain, AuditState, CheckResult, Fact
 from switch_audit.core.logging import logger
-from switch_audit.prompts import build_adviser_user_message, load_adviser_prompt, load_analyze_prompt
+from switch_audit.prompts import load_analyze_prompt
 from switch_audit.tools import ssh_exec
 from switch_audit.tools.crypto import decode_type7
 from switch_audit.tools.device_access import (
     classify_device_os,
     execute_check,
+    extract_version_string,
     load_methodology,
     probe_napalm,
 )
 from switch_audit.tools.guide_store import search_findings, store_finding
+from switch_audit.tools.nvd_enricher import enrich_with_nvd
 
 _TYPE7_RE = re.compile(r"((?:password|key)\s+7\s+([0-9A-Fa-f]{4,}))")
 
@@ -79,6 +81,7 @@ def profiler(state: AuditState) -> dict:
     )
 
     device_os, device_vendor = classify_device_os(raw)
+    device_version = extract_version_string(raw, device_os)
     napalm_ok = probe_napalm(state["target"], device_os)
     access_method = "napalm" if napalm_ok else "ntc-templates"
 
@@ -88,6 +91,7 @@ def profiler(state: AuditState) -> dict:
         "node.profiler.done",
         device_os=device_os,
         device_vendor=device_vendor,
+        device_version=device_version,
         access_method=access_method,
         pending_checks=len(pending),
     )
@@ -95,6 +99,7 @@ def profiler(state: AuditState) -> dict:
     return {
         "device_os": device_os,
         "device_vendor": device_vendor,
+        "device_version": device_version,
         "access_method": access_method,
         "pending_checks": pending,
         "completed_checks": [],
@@ -183,53 +188,44 @@ def store_success(state: AuditState) -> dict:
 # ---------------------------------------------------------------------------
 
 def adviser(state: AuditState) -> dict:
-    """Select the next audit check using an LLM.
+    """Select the next audit check — pure rule-based, zero LLM calls.
 
-    Priority the LLM is instructed to follow:
-      1. Checks in attack_chains.verification_needed  — confirm/refute live chains first
-      2. Checks that historically yield findings       — from enriched_strategy (memory layer)
-      3. Sequential fallback                           — first item in pending_checks
+    Rule 1: verification_needed priority
+      If any pending check appears in an active chain's verification_needed,
+      pick the one from the highest-severity chain first.
 
-    Falls back to sequential selection if the LLM call fails or returns an invalid check_id,
-    so a broken LLM never stalls the audit.
+    Rule 2: sequential fallback
+      Otherwise take pending_checks[0].
     """
     pending = state.get("pending_checks", [])
     if not pending:
         return {"proposed_check_id": "", "adviser_reasoning": "all checks complete"}
 
-    try:
-        user_msg = build_adviser_user_message(state)
-        response = _llm.invoke([
-            {"role": "system", "content": load_adviser_prompt()},
-            {"role": "user", "content": user_msg},
-        ])
+    pending_set = set(pending)
+    _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
-        raw = response.content.strip()
-        # Strip markdown code fences if present
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
-        data = json.loads(match.group(1) if match else raw)
+    # Rule 1: prioritise checks that would confirm/refute active chains
+    active_chains = [
+        c for c in state.get("attack_chains", [])
+        if c.get("confidence") not in ("confirmed", "refuted")
+        and c.get("verification_needed")
+    ]
+    active_chains.sort(key=lambda c: _SEV_RANK.get(c.get("severity", "low"), 3))
 
-        check_id = data.get("check_id", "")
-        reasoning = data.get("reasoning", "")
+    for chain in active_chains:
+        for cid in chain.get("verification_needed", []):
+            if cid in pending_set:
+                reasoning = (
+                    f"rule1: verifying chain '{chain['id']}' "
+                    f"({chain['severity']}/{chain['confidence']})"
+                )
+                logger.info("node.adviser", proposed_check_id=cid, reasoning=reasoning, remaining=len(pending))
+                return {"proposed_check_id": cid, "adviser_reasoning": reasoning}
 
-        if check_id not in pending:
-            logger.warning(
-                "node.adviser.invalid_id",
-                llm_returned=check_id,
-                fallback=pending[0],
-            )
-            check_id, reasoning = pending[0], f"[fallback: LLM returned invalid id] sequential"
-
-    except Exception as exc:
-        logger.warning("node.adviser.llm_failed", error=str(exc), fallback=pending[0])
-        check_id, reasoning = pending[0], "[fallback: LLM error] sequential"
-
-    logger.info(
-        "node.adviser",
-        proposed_check_id=check_id,
-        reasoning=reasoning,
-        remaining=len(pending),
-    )
+    # Rule 2: sequential
+    check_id = pending[0]
+    reasoning = "rule2: sequential"
+    logger.info("node.adviser", proposed_check_id=check_id, reasoning=reasoning, remaining=len(pending))
     return {"proposed_check_id": check_id, "adviser_reasoning": reasoning}
 
 
@@ -274,6 +270,47 @@ def executor(state: AuditState) -> dict:
         "completed_checks": completed,
         "trial_count": state["trial_count"] + 1,
     }
+
+
+# ---------------------------------------------------------------------------
+# enrich — inject live CVE intelligence before analyze
+# ---------------------------------------------------------------------------
+
+def enrich(state: AuditState) -> dict:
+    """Query NIST NVD for CVEs matching this device's OS + version.
+
+    Runs once per session (idempotent via cve_context check).
+    Writes cve_context — injected into analyze()'s user message so the LLM can
+    reference real CVE IDs when building AttackChains.
+    Fails silently: a network error or unsupported OS returns "" without breaking the audit.
+    """
+    if state.get("cve_context") is not None:
+        return {}  # already queried (None = not yet; "" = queried/no data; str = data)
+
+    device_os = state.get("device_os", "")
+    device_version = state.get("device_version", "")
+
+    # If profiler couldn't extract version from raw text, try NAPALM's parsed os_version
+    napalm_version_fallback = False
+    if not device_version:
+        for result in state.get("check_results", []):
+            if result["check_id"] == "device_identity" and result["access_method"] == "napalm":
+                device_version = result["data"].get("os_version", "")
+                napalm_version_fallback = bool(device_version)
+                break
+
+    logger.info("node.enrich", device_os=device_os, device_version=device_version)
+    ctx = enrich_with_nvd(device_os, device_version)
+
+    if ctx:
+        logger.info("node.enrich.done", cve_count=ctx.count("CVE-"))
+    else:
+        logger.info("node.enrich.no_data", device_os=device_os, version=device_version)
+
+    result: dict = {"cve_context": ctx}
+    if napalm_version_fallback:
+        result["device_version"] = device_version  # backfill state so it's visible in report
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -395,9 +432,14 @@ def _build_analyze_context(state: AuditState) -> str:
     # Precomputed Type 7 passwords
     precomputed = _precompute_decoded_passwords(_extract_text_for_precompute(latest))
 
-    return "\n\n".join([
-        latest_section, facts_section, chains_section, id_hint, pending_section
-    ]) + precomputed
+    # Live CVE context (injected once; enrich node sets this before first analyze call)
+    cve_ctx = state.get("cve_context") or ""
+
+    sections = [latest_section, facts_section, chains_section, id_hint, pending_section]
+    if cve_ctx:
+        sections.insert(1, cve_ctx)  # right after the check data, before existing facts
+
+    return "\n\n".join(sections) + precomputed
 
 
 def _parse_analyze_response(raw: str, current_trial: int) -> tuple[list, list]:

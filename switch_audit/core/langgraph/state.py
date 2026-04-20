@@ -91,6 +91,7 @@ class AuditState(TypedDict):
     # ── Device profile (written once by profiler) ────────────────────────────
     device_os: str      # canonical OS token: "cisco_iosxe" | "frr" | "arista_eos" | ...
     device_vendor: str  # human name: "Cisco" | "FRR" | "Arista" | "Unknown"
+    device_version: str # raw version string, e.g. "4.28.3F", "17.03.01a"; used by enrich
     access_method: str  # "napalm" | "ntc-templates" | "ssh-raw"
                         # determines which DeviceAccessLayer path executor uses
 
@@ -108,6 +109,9 @@ class AuditState(TypedDict):
     # ── Per-iteration handoff (adviser writes, executor reads) ───────────────
     proposed_check_id: str
     adviser_reasoning: str  # one-sentence explanation of why this check was chosen
+
+    # ── CVE enrichment (enrich writes, analyze reads) ───────────────────────
+    cve_context: str | None  # None = not yet queried; "" = queried, no results; Markdown = data
 
     # ── Memory enrichment (search_memory writes, adviser reads in Phase 2) ──
     enriched_strategy: str  # historical findings summary from ChromaDB; "" if cold start

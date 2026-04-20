@@ -2,14 +2,15 @@
 Audit graph topology — Phase 1 + memory layer.
 
 Flow:
-  START → profiler → search_memory → adviser → executor → analyze → store_success → _route
-                                                                                  → adviser (loop)
-                                                                                  └→ report → END
+  START → profiler → search_memory → adviser → executor → enrich → analyze → store_success → _route
+                                                                                            → adviser (loop)
+                                                                                            └→ report → END
 
 profiler       runs every iteration but returns {} after the first (idempotent).
 search_memory  queries ChromaDB for prior findings; populates enriched_strategy (runs once).
 adviser        picks the next pending check_id (sequential in Phase 1).
 executor       runs the check via DeviceAccessLayer; always returns a CheckResult.
+enrich         queries NIST NVD for CVEs matching device OS+version (idempotent, cached 6h).
 analyze        extracts Facts and updates AttackChains from the latest CheckResult.
 store_success  persists new Facts and confirmed chains back to ChromaDB.
 _route         loops to adviser while pending_checks remain; otherwise goes to report.
@@ -23,6 +24,7 @@ from langgraph.graph.state import CompiledStateGraph
 from switch_audit.core.langgraph.nodes import (
     adviser,
     analyze,
+    enrich,
     executor,
     profiler,
     report,
@@ -55,6 +57,7 @@ def build_graph() -> CompiledStateGraph:
     builder.add_node("search_memory", search_memory)
     builder.add_node("adviser", adviser)
     builder.add_node("executor", executor)
+    builder.add_node("enrich", enrich)
     builder.add_node("analyze", analyze)
     builder.add_node("store_success", store_success)
     builder.add_node("report", report)
@@ -63,7 +66,8 @@ def build_graph() -> CompiledStateGraph:
     builder.add_edge("profiler", "search_memory")
     builder.add_edge("search_memory", "adviser")
     builder.add_edge("adviser", "executor")
-    builder.add_edge("executor", "analyze")
+    builder.add_edge("executor", "enrich")
+    builder.add_edge("enrich", "analyze")
     builder.add_edge("analyze", "store_success")
     builder.add_conditional_edges(
         "store_success", _route, {"adviser": "adviser", "report": "report"}

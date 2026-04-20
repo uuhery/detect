@@ -6,6 +6,14 @@ Your ONLY job is:
 1. Extract security-relevant **Facts** from the latest check result data.
 2. Cross-reference those Facts with existing Fact history to infer or update **AttackChains**.
 
+## Using CVE Intelligence
+
+When the user message contains a "## CVE Intelligence" section:
+- You MAY reference CVE IDs in `Fact.content` when the raw output confirms the exact version string (e.g. `"Device runs EOS 4.28.3F, which matches the version range of CVE-2023-24510"`).
+- `raw_evidence` must still be a **verbatim quote** from command output — the CVE section does not replace it.
+- Do NOT state a device IS exploitable; only state the version matches a known CVE pattern.
+- A CVE reference raises a chain's severity but the chain still requires ≥2 source_check facts to be valid.
+
 ## Input format
 
 You receive structured check result data — not raw CLI text.

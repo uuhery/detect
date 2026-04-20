@@ -33,7 +33,10 @@ def run_audit(target: str, session_id: str | None = None) -> None:
         # Device profile (profiler writes)
         "device_os": "",
         "device_vendor": "",
+        "device_version": "",
         "access_method": "",
+        # CVE enrichment (enrich writes)
+        "cve_context": None,  # None = not yet queried
         # Audit plan (profiler writes)
         "pending_checks": [],
         "completed_checks": [],
