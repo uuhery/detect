@@ -66,11 +66,90 @@ def _now() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Default credential testing
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CREDS: list[tuple[str, str]] = [
+    ("cisco",    "cisco"),
+    ("admin",    "admin"),
+    ("admin",    "password"),
+    ("admin",    ""),
+    ("admin",    "1234"),
+    ("enable",   "cisco"),
+    ("netadmin", "netadmin"),
+    ("manager",  "manager"),
+    ("root",     "root"),
+    ("guest",    "guest"),
+]
+
+
+def _test_default_credentials(state: AuditState) -> CheckResult:
+    """Try known weak/default SSH credentials; report which ones work.
+
+    Skips the current working credential (already known good).
+    Uses 5s timeout per attempt to keep total time bounded (~45s worst case).
+    """
+    current = (settings.SSH_USERNAME, settings.SSH_PASSWORD)
+    working: list[dict] = []
+    tested = 0
+
+    for user, pwd in _DEFAULT_CREDS:
+        if (user, pwd) == current:
+            continue
+        raw = ssh_exec(
+            host=state["target"],
+            port=settings.SSH_PORT,
+            username=user,
+            password=pwd,
+            command="show version",
+            timeout=5,
+            device_type=settings.SSH_DEVICE_TYPE,
+        )
+        tested += 1
+        if not raw.startswith("[ssh_error]"):
+            working.append({"username": user, "password": pwd})
+            logger.info(
+                "device_access.default_cred_match",
+                target=state["target"],
+                username=user,
+            )
+
+    return CheckResult(
+        check_id="default_credentials",
+        data={"working_credentials": working, "tested_count": tested},
+        access_method="ssh-raw",
+        confidence="high",
+        timestamp=_now(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _resolve_cli(check: dict, device_os: str) -> str | None:
+    """Return the CLI command for this check on this device OS.
+
+    Priority (deterministic, no ambiguity):
+      cli_by_os[device_os]  >  cli_by_os["default"]  >  cli_fallback  >  None
+
+    None means the check is not applicable on this OS → caller returns unavailable.
+    Backward-compatible: checks without cli_by_os fall through to cli_fallback.
+    """
+    by_os = check.get("cli_by_os", {})
+    if by_os:
+        if device_os in by_os:
+            return by_os[device_os]        # None is a valid explicit "not supported"
+        return by_os.get("default")        # generic fallback within cli_by_os
+    return check.get("cli_fallback")       # legacy single-command format
+
+
 def execute_check(check_id: str, state: AuditState) -> CheckResult:
     """Execute one audit check, returning structured CheckResult on every path."""
+    # Algorithmic checks bypass the CLI access layers entirely
+    if check_id == "default_credentials":
+        return _test_default_credentials(state)
+
     check = get_check_spec(check_id)
     if not check:
         return CheckResult(
@@ -83,6 +162,7 @@ def execute_check(check_id: str, state: AuditState) -> CheckResult:
 
     device_os = state.get("device_os", "")
     access_method = state.get("access_method", "ssh-raw")
+    cli_cmd = _resolve_cli(check, device_os)
 
     # Layer 1: NAPALM — only when profiler confirmed it works for this device
     if check.get("napalm_getter") and access_method == "napalm":
@@ -91,14 +171,14 @@ def execute_check(check_id: str, state: AuditState) -> CheckResult:
             return result
 
     # Layer 2: ntc-templates — structured CLI parsing for known platforms
-    if check.get("parse_with") == "ntc-templates" and check.get("cli_fallback"):
-        result = _try_ntc_templates(check, state, device_os)
+    if check.get("parse_with") == "ntc-templates" and cli_cmd:
+        result = _try_ntc_templates(check, state, device_os, cli_cmd)
         if result:
             return result
 
     # Layer 3: ssh-raw — always possible, data is low-confidence
-    if check.get("cli_fallback"):
-        return _ssh_raw(check, state)
+    if cli_cmd:
+        return _ssh_raw(check, state, cli_cmd)
 
     return CheckResult(
         check_id=check_id,
@@ -156,12 +236,12 @@ def _try_napalm(check: dict, state: AuditState, device_os: str) -> CheckResult |
         return None
 
 
-def _try_ntc_templates(check: dict, state: AuditState, device_os: str) -> CheckResult | None:
+def _try_ntc_templates(check: dict, state: AuditState, device_os: str, cli_cmd: str) -> CheckResult | None:
     platform = _NTC_PLATFORMS.get(device_os)
     if not platform:
         return None  # no template for this OS → fall through to ssh-raw
 
-    command = check["cli_fallback"]
+    command = cli_cmd
     raw = _ssh(state, command)
     if raw.startswith("[ssh_error]"):
         return None
@@ -181,8 +261,8 @@ def _try_ntc_templates(check: dict, state: AuditState, device_os: str) -> CheckR
         return None
 
 
-def _ssh_raw(check: dict, state: AuditState) -> CheckResult:
-    command = check["cli_fallback"]
+def _ssh_raw(check: dict, state: AuditState, cli_cmd: str) -> CheckResult:
+    command = cli_cmd
     raw = _ssh(state, command)
     status = "ssh_error" if raw.startswith("[ssh_error]") else "ok"
     logger.info("device_access.ssh_raw", check_id=check["id"], status=status)

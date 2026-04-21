@@ -8,7 +8,9 @@
 #   category        — grouping for reporting
 #   description     — human-readable check name
 #   napalm_getter   — NAPALM getter method name; null means no structured getter exists
-#   cli_fallback    — CLI command to run when NAPALM is unavailable
+#   cli_fallback    — legacy single-command fallback (used when cli_by_os absent)
+#   cli_by_os       — per-OS command map; key "default" is the generic fallback;
+#                     null value means check is not applicable on that OS → unavailable
 #   parse_with      — "ntc-templates" to get structured rows; omit for ssh-raw
 #   security_relevance — one sentence explaining the security significance
 
@@ -18,6 +20,14 @@ checks:
     description: Device facts (vendor, model, OS version, serial)
     napalm_getter: get_facts
     cli_fallback: "show version"
+    cli_by_os:
+      cisco_iosxe:    "show version"
+      cisco_ios:      "show version"
+      cisco_nxos:     "show version"
+      arista_eos:     "show version"
+      juniper_junos:  "show version"
+      frr:            "show version"
+      default:        "show version"
     parse_with: ntc-templates
     security_relevance: Confirms exact OS version for CVE matching; detects EOL software.
 
@@ -26,6 +36,14 @@ checks:
     description: Full running configuration
     napalm_getter: get_config
     cli_fallback: "show running-config"
+    cli_by_os:
+      cisco_iosxe:    "show running-config"
+      cisco_ios:      "show running-config"
+      cisco_nxos:     "show running-config"
+      arista_eos:     "show running-config"
+      juniper_junos:  "show configuration"
+      frr:            "show running-config"
+      default:        "show running-config"
     security_relevance: Highest-density source for absent security controls (banners, ACLs, timeouts, weak ciphers).
 
   - id: local_accounts
@@ -33,6 +51,14 @@ checks:
     description: Local user accounts and privilege levels
     napalm_getter: get_users
     cli_fallback: "show running-config | section username"
+    cli_by_os:
+      cisco_iosxe:    "show running-config | section username"
+      cisco_ios:      "show running-config | section username"
+      cisco_nxos:     "show running-config | section username"
+      arista_eos:     "show running-config | section username"
+      juniper_junos:  "show configuration system login"
+      frr:            null
+      default:        "show running-config | section username"
     security_relevance: Unnecessary privileged accounts extend the attack surface for credential-based lateral movement.
 
   - id: snmp_config
@@ -40,6 +66,14 @@ checks:
     description: SNMP community strings and version
     napalm_getter: get_snmp_information
     cli_fallback: "show snmp community"
+    cli_by_os:
+      cisco_iosxe:    "show snmp community"
+      cisco_ios:      "show snmp community"
+      cisco_nxos:     "show snmp community"
+      arista_eos:     "show snmp community"
+      juniper_junos:  "show snmp community"
+      frr:            null
+      default:        "show snmp community"
     parse_with: ntc-templates
     security_relevance: SNMPv1/v2c community strings are cleartext and world-readable; default "public"/"private" strings are trivially guessable.
 
@@ -48,6 +82,14 @@ checks:
     description: LLDP/CDP neighbor table (topology exposure)
     napalm_getter: get_lldp_neighbors_detail
     cli_fallback: "show lldp neighbors detail"
+    cli_by_os:
+      cisco_iosxe:    "show lldp neighbors detail"
+      cisco_ios:      "show cdp neighbors detail"
+      cisco_nxos:     "show lldp neighbors detail"
+      arista_eos:     "show lldp neighbors detail"
+      juniper_junos:  "show lldp neighbors"
+      frr:            null
+      default:        "show lldp neighbors detail"
     parse_with: ntc-templates
     security_relevance: Discovery protocols leak device model, IP, and topology to any host on the segment.
 
@@ -56,6 +98,14 @@ checks:
     description: Interface IP addresses and operational state
     napalm_getter: get_interfaces_ip
     cli_fallback: "show ip interface brief"
+    cli_by_os:
+      cisco_iosxe:    "show ip interface brief"
+      cisco_ios:      "show ip interface brief"
+      cisco_nxos:     "show ip interface brief"
+      arista_eos:     "show ip interface brief"
+      juniper_junos:  "show interfaces terse"
+      frr:            "show interface"
+      default:        "show ip interface brief"
     parse_with: ntc-templates
     security_relevance: Unused interfaces left in UP state are unsecured entry points.
 
@@ -64,6 +114,14 @@ checks:
     description: ARP table entries
     napalm_getter: get_arp_table
     cli_fallback: "show ip arp"
+    cli_by_os:
+      cisco_iosxe:    "show ip arp"
+      cisco_ios:      "show ip arp"
+      cisco_nxos:     "show ip arp"
+      arista_eos:     "show arp"
+      juniper_junos:  "show arp"
+      frr:            "show ip arp"
+      default:        "show ip arp"
     parse_with: ntc-templates
     security_relevance: Duplicate IP or unexpected MAC entries indicate ARP spoofing or rogue hosts.
 
@@ -72,6 +130,14 @@ checks:
     description: VLAN database and trunk port allowed VLANs
     napalm_getter: null
     cli_fallback: "show vlan brief"
+    cli_by_os:
+      cisco_iosxe:    "show vlan brief"
+      cisco_ios:      "show vlan brief"
+      cisco_nxos:     "show vlan brief"
+      arista_eos:     "show vlan"
+      juniper_junos:  "show vlans"
+      frr:            null
+      default:        "show vlan brief"
     parse_with: ntc-templates
     security_relevance: Native VLAN 1 on trunks and unrestricted trunk allowed-VLANs enable VLAN-hopping attacks.
 
@@ -80,6 +146,14 @@ checks:
     description: STP root bridge, port roles, and protection features
     napalm_getter: null
     cli_fallback: "show spanning-tree"
+    cli_by_os:
+      cisco_iosxe:    "show spanning-tree"
+      cisco_ios:      "show spanning-tree"
+      cisco_nxos:     "show spanning-tree"
+      arista_eos:     "show spanning-tree"
+      juniper_junos:  "show spanning-tree bridge"
+      frr:            null
+      default:        "show spanning-tree"
     parse_with: ntc-templates
     security_relevance: Unauthorized STP root-bridge election can redirect all traffic through an attacker-controlled switch.
 
@@ -88,5 +162,95 @@ checks:
     description: SSH version and enabled cipher/MAC algorithms
     napalm_getter: null
     cli_fallback: "show ip ssh"
+    cli_by_os:
+      cisco_iosxe:    "show ip ssh"
+      cisco_ios:      "show ip ssh"
+      cisco_nxos:     "show ssh"
+      arista_eos:     "show management ssh"
+      juniper_junos:  "show system services ssh"
+      frr:            null
+      default:        "show ip ssh"
     parse_with: ntc-templates
     security_relevance: SSHv1 is cryptographically broken; weak ciphers expose management sessions to MITM.
+
+  - id: bgp_security
+    category: routing_protocols
+    description: BGP neighbor authentication and route filtering
+    napalm_getter: null
+    cli_fallback: "show running-config | section ^router bgp"
+    cli_by_os:
+      cisco_iosxe:    "show running-config | section ^router bgp"
+      cisco_ios:      "show running-config | section ^router bgp"
+      cisco_nxos:     "show running-config | section ^router bgp"
+      arista_eos:     "show running-config | section ^router bgp"
+      juniper_junos:  "show configuration protocols bgp"
+      frr:            "show running-config | section bgp"
+      default:        "show running-config | section ^router bgp"
+    security_relevance: BGP without MD5 authentication or prefix-list filtering allows prefix hijacking and route poisoning.
+
+  - id: ospf_security
+    category: routing_protocols
+    description: OSPF neighbor authentication configuration
+    napalm_getter: null
+    cli_fallback: "show running-config | section ^router ospf"
+    cli_by_os:
+      cisco_iosxe:    "show running-config | section ^router ospf"
+      cisco_ios:      "show running-config | section ^router ospf"
+      cisco_nxos:     "show running-config | section ^router ospf"
+      arista_eos:     "show running-config | section ^router ospf"
+      juniper_junos:  "show configuration protocols ospf"
+      frr:            "show running-config | section ^router ospf"
+      default:        "show running-config | section ^router ospf"
+    security_relevance: OSPF without authentication allows false LSA injection, redirecting traffic to attacker-controlled paths.
+
+  - id: aaa_config
+    category: access_auth
+    description: AAA authentication, authorization and accounting configuration
+    napalm_getter: null
+    cli_fallback: "show running-config | section ^aaa"
+    cli_by_os:
+      cisco_iosxe:    "show running-config | section ^aaa"
+      cisco_ios:      "show running-config | section ^aaa"
+      cisco_nxos:     "show running-config | section ^aaa"
+      arista_eos:     "show running-config | section ^aaa"
+      juniper_junos:  "show configuration system authentication"
+      frr:            null
+      default:        "show running-config | section ^aaa"
+    security_relevance: Missing AAA or local-auth fallback enables TACACS+/RADIUS bypass; cleartext RADIUS keys are sniffable.
+
+  - id: acl_summary
+    category: firewall
+    description: Access control lists — VTY/management access restrictions
+    napalm_getter: null
+    cli_fallback: "show ip access-lists"
+    cli_by_os:
+      cisco_iosxe:    "show ip access-lists"
+      cisco_ios:      "show ip access-lists"
+      cisco_nxos:     "show ip access-lists"
+      arista_eos:     "show ip access-lists"
+      juniper_junos:  "show firewall filter"
+      frr:            "show access-list"
+      default:        "show ip access-lists"
+    security_relevance: VTY lines without access-class allow management access from any source IP.
+
+  - id: ntp_config
+    category: management_protocols
+    description: NTP synchronization status and authentication
+    napalm_getter: get_ntp_stats
+    cli_fallback: "show ntp status"
+    cli_by_os:
+      cisco_iosxe:    "show ntp status"
+      cisco_ios:      "show ntp status"
+      cisco_nxos:     "show ntp status"
+      arista_eos:     "show ntp status"
+      juniper_junos:  "show ntp status"
+      frr:            null
+      default:        "show ntp status"
+    security_relevance: Unauthenticated NTP allows time-spoofing attacks, corrupting log timestamps and certificate validity.
+
+  - id: default_credentials
+    category: access_auth
+    description: Test known default and weak SSH credentials
+    napalm_getter: null
+    cli_fallback: null
+    security_relevance: Unchanged factory-default credentials allow immediate admin access with no prior knowledge.

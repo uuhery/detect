@@ -13,6 +13,7 @@ Each node only returns the fields it modifies.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
@@ -40,9 +41,7 @@ from switch_audit.tools.device_access import (
 from switch_audit.tools.guide_store import search_chain_patterns, store_chain_pattern
 from switch_audit.tools.nvd_enricher import enrich_with_nvd
 from switch_audit.tools.session_store import (
-    build_resume_state,
     load_finding_timeline,
-    load_prior_session,
     save_session,
 )
 
@@ -94,23 +93,14 @@ def profiler(state: AuditState) -> dict:
 
     methodology = load_methodology()
 
-    # Load prior session for this target — enables incremental delta auditing
-    prior = load_prior_session(state["target"])
-    if prior:
-        resume = build_resume_state(prior, methodology)
-        extra = {
-            "facts":            resume["facts"],
-            "attack_chains":    resume["attack_chains"],
-            "completed_checks": resume["completed_checks"],
-            "pending_checks":   resume["pending_checks"],
-        }
-    else:
-        extra = {
-            "facts":            [],
-            "attack_chains":    [],
-            "completed_checks": [],
-            "pending_checks":   [c["id"] for c in methodology],
-        }
+    # Always start fresh — no fact/chain carry-over from prior sessions.
+    # Cross-session history is tracked separately via finding_timeline in session_store.
+    extra = {
+        "facts":            [],
+        "attack_chains":    [],
+        "completed_checks": [],
+        "pending_checks":   [c["id"] for c in methodology],
+    }
 
     logger.info(
         "node.profiler.done",
@@ -119,7 +109,6 @@ def profiler(state: AuditState) -> dict:
         device_version=device_version,
         access_method=access_method,
         pending_checks=len(extra["pending_checks"]),
-        resumed=bool(prior),
     )
 
     return {
@@ -164,13 +153,185 @@ def search_memory(state: AuditState) -> dict:
 # ---------------------------------------------------------------------------
 
 def store_success(state: AuditState) -> dict:
-    """Placeholder after analyze — ChromaDB storage happens at report time.
+    """Chain integrity validator — pure computation, no I/O, cannot fail.
 
-    All confirmed chains are persisted in report() once the session is complete,
-    ensuring the stored pattern reflects the final confirmed state, not mid-session
-    partial information.
+    Runs after every analyze pass to catch two classes of LLM output errors
+    before they propagate to session_store or report:
+
+    Rule 1 — Ghost fact references: remove fact_ids that don't exist in state.facts.
+      LLMs occasionally hallucinate IDs like "f3-5" when only f3-0..f3-3 exist.
+      Leaving ghost refs in chains causes misleading evidence counts in the report.
+
+    Rule 2 — Confirmed chains with non-empty verification_needed: force-clear.
+      The prompt enforces this but the LLM occasionally violates it.
+      A confirmed chain with pending verification is a logical contradiction.
+
+    Returns {} when no corrections are needed (common case, zero overhead).
     """
+    # Rule 3: deduplicate facts by (source_check, content) — LLM occasionally
+    # extracts the same observation twice from one check result.
+    raw_facts = state.get("facts", [])
+    seen_fact_keys: set[tuple[str, str]] = set()
+    deduped_facts: list[dict] = []
+    for f in raw_facts:
+        key = (f.get("source_check", ""), f.get("content", "").strip())
+        if key in seen_fact_keys:
+            logger.warning(
+                "store_success.duplicate_fact",
+                fact_id=f["id"], source_check=f.get("source_check"),
+            )
+        else:
+            seen_fact_keys.add(key)
+            deduped_facts.append(f)
+
+    any_change = len(deduped_facts) != len(raw_facts)
+    fact_ids_in_state = {f["id"] for f in deduped_facts}
+    chains = state.get("attack_chains", [])
+    corrected: list[dict] = []
+
+    for chain in chains:
+        c = dict(chain)
+
+        # Rule 1: strip ghost fact references
+        valid = [fid for fid in c.get("fact_ids", []) if fid in fact_ids_in_state]
+        if len(valid) != len(c.get("fact_ids", [])):
+            ghost = set(c["fact_ids"]) - set(valid)
+            logger.warning(
+                "store_success.ghost_fact_ids",
+                chain_id=c["id"], chain_title=c.get("title", ""),
+                ghost_ids=sorted(ghost),
+            )
+            c["fact_ids"] = valid
+            any_change = True
+
+        # Rule 2: confirmed must have empty verification_needed
+        if c.get("confidence") == "confirmed" and c.get("verification_needed"):
+            logger.warning(
+                "store_success.confirmed_with_verification",
+                chain_id=c["id"], stale_checks=c["verification_needed"],
+            )
+            c["verification_needed"] = []
+            any_change = True
+
+        corrected.append(c)
+
+    if any_change:
+        return {"facts": deduped_facts, "attack_chains": corrected}
     return {}
+
+
+# ---------------------------------------------------------------------------
+# discover — extract neighbor IPs from LLDP/ARP results into discovery_queue
+# ---------------------------------------------------------------------------
+
+_SKIP_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local
+    ipaddress.ip_network("224.0.0.0/4"),      # multicast
+    ipaddress.ip_network("255.255.255.255/32"),
+    ipaddress.ip_network("0.0.0.0/8"),
+]
+
+
+def _is_routable(ip_str: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return not any(addr in net for net in _SKIP_NETS)
+    except ValueError:
+        return False
+
+
+def _extract_lldp_ips(result: CheckResult) -> set[str]:
+    """Extract management IPs from LLDP CheckResult.
+
+    Handles two formats:
+    - NAPALM get_lldp_neighbors_detail: {"Eth0/1": [{"remote_management_address": "10.0.0.2", ...}]}
+    - ntc-templates: {"rows": [{"MANAGEMENT_ADDRESS": "10.0.0.2", ...}]}
+    """
+    ips: set[str] = set()
+    data = result.get("data", {})
+
+    # NAPALM format: dict of interface → list of neighbor dicts
+    if isinstance(data, dict) and "rows" not in data and "raw" not in data:
+        for neighbors in data.values():
+            for nbr in (neighbors if isinstance(neighbors, list) else []):
+                for key in ("remote_management_address", "management_address"):
+                    val = nbr.get(key, "")
+                    if val and _is_routable(val):
+                        ips.add(val)
+
+    # ntc-templates format
+    for row in data.get("rows", []):
+        for key in ("MANAGEMENT_ADDRESS", "MGMT_ADDRESS", "management_address"):
+            val = row.get(key, "")
+            if val and _is_routable(val):
+                ips.add(val)
+
+    return ips
+
+
+def _extract_arp_ips(result: CheckResult) -> set[str]:
+    """Extract IPs from ARP CheckResult.
+
+    Handles two formats:
+    - NAPALM get_arp_table: [{"ip": "10.0.0.1", ...}]  (list, not dict)
+    - ntc-templates: {"rows": [{"PROTOCOL_ADDRESS": "10.0.0.1", ...}]}
+    """
+    ips: set[str] = set()
+    data = result.get("data", {})
+
+    # NAPALM format: raw list
+    if isinstance(data, list):
+        for entry in data:
+            val = entry.get("ip", "")
+            if val and _is_routable(val):
+                ips.add(val)
+
+    # NAPALM wrapped as {"rows": [...]}
+    # ntc-templates format
+    for row in data.get("rows", []):
+        for key in ("PROTOCOL_ADDRESS", "IP_ADDRESS", "ip"):
+            val = row.get(key, "")
+            if val and _is_routable(val):
+                ips.add(val)
+
+    return ips
+
+
+def discover(state: AuditState) -> dict:
+    """Extract neighbor IPs from LLDP/ARP CheckResult into discovery_queue.
+
+    Only runs when the latest check is lldp_neighbors or arp_table.
+    Maintains BFS invariant I1: discovery_queue ∩ visited_targets = ∅.
+    Results are sorted for deterministic ordering.
+    """
+    results = state.get("check_results", [])
+    if not results:
+        return {}
+    latest = results[-1]
+
+    if latest["check_id"] == "lldp_neighbors":
+        found = _extract_lldp_ips(latest)
+    elif latest["check_id"] == "arp_table":
+        found = _extract_arp_ips(latest)
+    else:
+        return {}  # guard: conditional routing in graph should prevent this
+
+    visited = set(state.get("visited_targets", [state["target"]]))
+    already_queued = set(state.get("discovery_queue", []))
+    fresh = sorted(ip for ip in found if ip not in visited and ip not in already_queued)
+
+    if fresh:
+        logger.info(
+            "node.discover.found",
+            source=latest["check_id"],
+            count=len(fresh),
+            ips=fresh,
+        )
+    return {
+        "discovery_queue": state.get("discovery_queue", []) + fresh,
+        "visited_targets": list(visited),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -357,28 +518,73 @@ def _build_analyze_context(state: AuditState) -> str:
         f"Collected data:\n```json\n{data_str}\n```"
     )
 
-    # Existing facts (full list, condensed: no raw_evidence to save tokens)
+    # --- Two-zone fact model: O(k) context, not O(n_total_facts) ---
+    # Hot zone: recent facts + facts referenced by open (unconfirmed) chains
+    # Archive zone: facts only in confirmed/refuted chains → single summary line
     existing_facts = state.get("facts", [])
-    if existing_facts:
+    existing_chains = state.get("attack_chains", [])
+
+    open_chain_fact_ids: set[str] = {
+        fid
+        for c in existing_chains
+        if c.get("confidence") not in ("confirmed", "refuted")
+        for fid in c.get("fact_ids", [])
+    }
+    recent_trials = {current_trial, current_trial - 1}
+
+    hot_facts = [
+        f for f in existing_facts
+        if f["id"] in open_chain_fact_ids or f.get("trial") in recent_trials
+    ]
+    cold_count = len(existing_facts) - len(hot_facts)
+
+    if hot_facts:
         facts_lines = [
-            f"  [{f['id']}] (from check '{f['source_check']}', trial={f['trial']}): {f['content']}"
-            for f in existing_facts
+            f"  [{f['id']}] (check '{f['source_check']}', trial={f['trial']}): {f['content']}"
+            for f in hot_facts
         ]
         facts_section = (
             "## Existing Facts (reference by id when building chains)\n"
             + "\n".join(facts_lines)
         )
+        if cold_count:
+            facts_section += (
+                f"\n  ... {cold_count} more fact(s) in confirmed/refuted chains"
+                " (omitted — reference their IDs directly if needed)"
+            )
     else:
         facts_section = "## Existing Facts\n  (none yet)"
+        if cold_count:
+            facts_section += f"\n  ({cold_count} fact(s) in confirmed/refuted chains — omitted)"
 
-    # Existing chains
-    existing_chains = state.get("attack_chains", [])
-    if existing_chains:
-        chains_lines = [
+    # --- Two-tier chain context ---
+    # Open chains (speculative/likely): full detail — LLM still needs to update them
+    # Confirmed chains: id/title/facts summary only (attack_narrative omitted)
+    # Refuted chains: omitted entirely
+    live_chains   = [c for c in existing_chains if c.get("confidence") not in ("confirmed", "refuted")]
+    closed_chains = [c for c in existing_chains if c.get("confidence") == "confirmed"]
+
+    chains_lines: list[str] = []
+
+    # Confirmed chains: title+severity only — they are closed; LLM must not reopen them.
+    # Auto-dedup (_find_overlapping_chain) prevents duplicate chain creation.
+    if closed_chains:
+        closed_summary = ", ".join(
+            f"\"{c['title']}\" [{c['severity']}]" for c in closed_chains
+        )
+        chains_lines.append(
+            f"  Confirmed ({len(closed_chains)}): {closed_summary}"
+        )
+
+    # Open chains: full detail — LLM still needs to update confidence / add facts.
+    for c in live_chains:
+        chains_lines.append(
             f"  [{c['id']}] \"{c['title']}\" | facts={c['fact_ids']} | "
-            f"severity={c['severity']} | confidence={c['confidence']}"
-            for c in existing_chains
-        ]
+            f"severity={c['severity']} | confidence={c['confidence']} | "
+            f"verify={c.get('verification_needed', [])}"
+        )
+
+    if chains_lines:
         chains_section = (
             "## Existing AttackChains "
             "(set existing_chain_id to update, or null to create new)\n"
@@ -387,8 +593,8 @@ def _build_analyze_context(state: AuditState) -> str:
     else:
         chains_section = "## Existing AttackChains\n  (none yet)"
 
-    # ID hints
-    facts_this_trial = sum(1 for f in existing_facts if f["trial"] == current_trial)
+    # ID hints — count all facts in current trial (not just hot ones)
+    facts_this_trial = sum(1 for f in existing_facts if f.get("trial") == current_trial)
     id_hint = (
         f"## ID Hints\n"
         f"  Current trial: {current_trial}\n"

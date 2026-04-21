@@ -116,6 +116,10 @@ class AuditState(TypedDict):
     # ── Memory enrichment (search_memory writes, adviser reads in Phase 2) ──
     enriched_strategy: str  # historical findings summary from ChromaDB; "" if cold start
 
+    # ── Lateral discovery (discover writes, main.py reads) ──────────────────
+    discovery_queue: list[str]   # neighbor IPs found via LLDP/ARP; BFS queue source
+    visited_targets: list[str]   # devices already audited; prevents BFS cycles (I1)
+
     # ── Control ─────────────────────────────────────────────────────────────
     trial_count: int
     status: str      # "running" | "completed" | "error"

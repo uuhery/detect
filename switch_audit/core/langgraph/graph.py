@@ -1,5 +1,5 @@
 """
-Audit graph topology — Phase 1 + memory layer.
+Audit graph topology.
 
 Flow:
   START → profiler → search_memory → adviser → executor → enrich → analyze → store_success → _route
@@ -12,7 +12,7 @@ adviser        picks the next pending check_id (pure rule-based, zero LLM calls)
 executor       runs the check via DeviceAccessLayer; always returns a CheckResult.
 enrich         queries NIST NVD for CVEs matching device OS+version (idempotent, cached 6h).
 analyze        extracts Facts and updates AttackChains from the latest CheckResult.
-store_success  persists new Facts and confirmed chains back to ChromaDB.
+store_success  validates chain integrity (ghost fact_ids, confidence contradictions).
 _route         loops to adviser while pending_checks remain; otherwise goes to report.
 report         writes the Markdown report and marks status = "completed".
 """
@@ -24,6 +24,7 @@ from langgraph.graph.state import CompiledStateGraph
 from switch_audit.core.langgraph.nodes import (
     adviser,
     analyze,
+    discover,
     enrich,
     executor,
     profiler,
@@ -33,15 +34,27 @@ from switch_audit.core.langgraph.nodes import (
 )
 from switch_audit.core.langgraph.state import AuditState
 from switch_audit.core.logging import logger
+from switch_audit.tools.device_access import load_methodology
 
-_MAX_TRIALS = 12  # safety ceiling; methodology has 10 checks, allow headroom
+
+def _compute_max_trials() -> int:
+    """Derive trial ceiling from methodology size.
+
+    Base: one trial per check.
+    Buffer: 40% headroom for verification_needed re-runs.
+    Formula: max(15, ceil(n_checks * 1.4))
+
+    With 16 checks → 23 trials. Scales automatically as checks are added.
+    """
+    n = len(load_methodology())
+    return max(15, int(n * 1.4) + (1 if n * 1.4 % 1 else 0))
 
 
-def _route(state: AuditState) -> str:
+def _route(state: AuditState, max_trials: int) -> str:
     """Route after store_success: loop to adviser or terminate to report."""
     if state["status"] != "running":
         return "report"
-    if state["trial_count"] >= _MAX_TRIALS:
+    if state["trial_count"] >= max_trials:
         logger.info("graph.route.max_trials", trials=state["trial_count"])
         return "report"
     if state.get("pending_checks"):
@@ -51,29 +64,47 @@ def _route(state: AuditState) -> str:
 
 
 def build_graph() -> CompiledStateGraph:
+    max_trials = _compute_max_trials()
+
+    # Capture max_trials in closure for _route
+    def route(state: AuditState) -> str:
+        return _route(state, max_trials)
+
     builder = StateGraph(AuditState)
 
     builder.add_node("profiler", profiler)
     builder.add_node("search_memory", search_memory)
     builder.add_node("adviser", adviser)
     builder.add_node("executor", executor)
+    builder.add_node("discover", discover)
     builder.add_node("enrich", enrich)
     builder.add_node("analyze", analyze)
     builder.add_node("store_success", store_success)
     builder.add_node("report", report)
 
+    def _route_to_discover(state: AuditState) -> str:
+        results = state.get("check_results", [])
+        if results and results[-1]["check_id"] in ("lldp_neighbors", "arp_table"):
+            return "discover"
+        return "enrich"
+
     builder.add_edge(START, "profiler")
     builder.add_edge("profiler", "search_memory")
     builder.add_edge("search_memory", "adviser")
     builder.add_edge("adviser", "executor")
-    builder.add_edge("executor", "enrich")
+    builder.add_conditional_edges(
+        "executor",
+        _route_to_discover,
+        {"discover": "discover", "enrich": "enrich"},
+    )
+    builder.add_edge("discover", "enrich")
     builder.add_edge("enrich", "analyze")
     builder.add_edge("analyze", "store_success")
     builder.add_conditional_edges(
-        "store_success", _route, {"adviser": "adviser", "report": "report"}
+        "store_success", route, {"adviser": "adviser", "report": "report"}
     )
     builder.add_edge("report", END)
 
     graph = builder.compile(checkpointer=MemorySaver(), name="switch-audit-v2")
-    logger.info("graph.built", max_trials=_MAX_TRIALS)
+    logger.info("graph.built", max_trials=max_trials, n_checks=len(load_methodology()))
     return graph
