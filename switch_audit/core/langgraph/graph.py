@@ -8,7 +8,7 @@ Flow:
 
 profiler       runs every iteration but returns {} after the first (idempotent).
 search_memory  queries ChromaDB for prior findings; populates enriched_strategy (runs once).
-adviser        picks the next pending check_id (sequential in Phase 1).
+adviser        picks the next pending check_id (pure rule-based, zero LLM calls).
 executor       runs the check via DeviceAccessLayer; always returns a CheckResult.
 enrich         queries NIST NVD for CVEs matching device OS+version (idempotent, cached 6h).
 analyze        extracts Facts and updates AttackChains from the latest CheckResult.
@@ -41,13 +41,13 @@ def _route(state: AuditState) -> str:
     """Route after store_success: loop to adviser or terminate to report."""
     if state["status"] != "running":
         return "report"
-    if not state.get("pending_checks"):
-        logger.info("graph.route.all_checks_done", trials=state["trial_count"])
-        return "report"
     if state["trial_count"] >= _MAX_TRIALS:
         logger.info("graph.route.max_trials", trials=state["trial_count"])
         return "report"
-    return "adviser"
+    if state.get("pending_checks"):
+        return "adviser"
+    logger.info("graph.route.all_checks_done", trials=state["trial_count"])
+    return "report"
 
 
 def build_graph() -> CompiledStateGraph:
