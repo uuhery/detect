@@ -113,17 +113,6 @@ def save_session(
             if chain.get("confidence") in ("confirmed", "likely"):
                 _upsert_timeline(conn, target, chain, completed_at)
 
-        # Mark chains that disappeared as potentially resolved
-        active_titles = {_title_hash(c["title"]) for c in chains if c.get("confidence") != "refuted"}
-        conn.execute(
-            """UPDATE finding_timeline SET status='resolved'
-               WHERE target=? AND chain_title_hash NOT IN ({})
-               AND status='active'""".format(
-                ",".join("?" * len(active_titles)) if active_titles else "''"
-            ),
-            [target] + list(active_titles) if active_titles else [target],
-        )
-
         conn.commit()
         conn.close()
         logger.info(
@@ -187,7 +176,7 @@ def load_prior_session(target: str) -> dict | None:
             "completed_at":     row[2],
             "completed_checks": json.loads(row[3] or "[]"),
             "facts":            json.loads(row[4] or "[]"),
-            "chains":           json.loads(row[5] or "[]"),
+            "attack_chains":    json.loads(row[5] or "[]"),
         }
     except Exception as exc:
         logger.warning("session_store.load_failed", error=str(exc))
@@ -235,7 +224,7 @@ def build_resume_state(prior: dict, methodology: list[dict]) -> dict:
     prior_fact_checks = {f["source_check"] for f in prior["facts"]}
     prior_speculative_needed = {
         cid
-        for c in prior["chains"]
+        for c in prior["attack_chains"]
         if c.get("confidence") in ("speculative", "likely")
         for cid in c.get("verification_needed", [])
     }
@@ -265,8 +254,8 @@ def build_resume_state(prior: dict, methodology: list[dict]) -> dict:
     )
 
     return {
-        "facts": prior["facts"],
-        "attack_chains": prior["chains"],
+        "facts":            prior["facts"],
+        "attack_chains":    prior["attack_chains"],
         "completed_checks": prior["completed_checks"],
-        "pending_checks": pending,
+        "pending_checks":   pending,
     }

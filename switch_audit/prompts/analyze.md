@@ -53,7 +53,7 @@ A Fact ends where the raw output ends. Everything after "therefore", "indicating
 > "Enable password is encoded with Type 7 (`enable password 7 ...`)."
 > "Device is running IOS XE Software, Version 17.15.01."
 
-**Do not assess EOL status, patch levels, or exploitability** — you do not have access to vendor advisories or CVE databases. Only state what the output shows.
+Only state what the output directly shows. Do not infer impact or exploitability beyond what raw evidence supports.
 
 Only extract facts with **security relevance**. Skip purely informational output (e.g., uptime, memory size, configuration register value, boot image path).
 

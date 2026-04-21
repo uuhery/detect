@@ -1,11 +1,15 @@
 """
-ChromaDB-backed audit memory.
+ChromaDB-backed cross-session attack pattern memory.
 
-Stores anonymised security findings and attack chain summaries so future
-audits of the same device type start with prior knowledge instead of cold.
+Stores CONFIRMED attack chain narratives (not individual Facts).
+The unit of storage is a reusable pattern: what combination of conditions
+on what device OS leads to what exploitable path.
 
-All methods fail silently — a missing chromadb install or unavailable
-embedding endpoint must never crash the audit pipeline.
+On retrieval, search_memory formats results as a "## Historical Patterns"
+block injected into the analyze LLM's user message — giving it expert
+knowledge from prior audits of similar devices.
+
+All methods fail silently — ChromaDB unavailability never blocks the audit.
 """
 
 from __future__ import annotations
@@ -16,11 +20,9 @@ import re
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
-
 _DB_PATH = Path.home() / ".detect" / "guides"
-_COLLECTION = "audit_findings"
-
-_col = None  # lazy-initialised singleton
+_COLLECTION = "chain_patterns"
+_col = None
 
 
 def _get_collection():
@@ -36,7 +38,6 @@ def _get_collection():
         _col = client.get_or_create_collection(
             _COLLECTION, embedding_function=DefaultEmbeddingFunction()
         )
-        _log.info("guide_store.ready", path=str(_DB_PATH))
         return _col
     except Exception as exc:
         _log.warning("guide_store.init_failed error=%s", exc)
@@ -49,44 +50,68 @@ def _anonymize(text: str) -> str:
     return text
 
 
-def search_findings(device_os: str, context: str, n: int = 5) -> list[dict]:
-    """Return up to n relevant prior findings for device_os + context query."""
-    col = _get_collection()
-    if col is None:
-        return []
-    try:
-        where = {"device_os": {"$eq": device_os}} if device_os not in ("unknown", "") else None
-        kwargs: dict = {"query_texts": [f"{device_os} {context}"], "n_results": n}
-        if where:
-            kwargs["where"] = where
-        results = col.query(**kwargs)
-        docs = results.get("documents", [[]])[0]
-        metas = results.get("metadatas", [[]])[0]
-        if not docs:
-            return []
-        return [{"content": d, "meta": m} for d, m in zip(docs, metas)]
-    except Exception as exc:
-        _log.warning("guide_store.search_failed error=%s", exc)
-        return []
+def store_chain_pattern(device_os: str, chain: dict) -> None:
+    """Store a confirmed attack chain as a reusable pattern for future audits.
 
-
-def store_finding(
-    device_os: str,
-    check_id: str,
-    content: str,
-    severity: str,
-) -> None:
-    """Upsert one anonymised finding into the collection."""
+    Stored text = full narrative, anonymised. Metadata carries severity + title
+    for formatting. Upserted by content hash so re-running the same audit
+    doesn't create duplicate entries.
+    """
     col = _get_collection()
     if col is None:
         return
     try:
-        anon = _anonymize(content)
-        doc_id = hashlib.md5(f"{device_os}:{check_id}:{anon}".encode()).hexdigest()
+        narrative = _anonymize(chain.get("attack_narrative", ""))
+        title = chain.get("title", "")
+        severity = chain.get("severity", "medium")
+        # Document = what the LLM will read: structured pattern description
+        document = (
+            f"[{severity.upper()}] {title}\n"
+            f"Attack path: {narrative}"
+        )
+        doc_id = hashlib.md5(f"{device_os}:{title}:{narrative[:100]}".encode()).hexdigest()
         col.upsert(
-            documents=[anon],
-            metadatas=[{"device_os": device_os, "check_id": check_id, "severity": severity}],
+            documents=[document],
+            metadatas=[{"device_os": device_os, "severity": severity, "title": title}],
             ids=[doc_id],
         )
+        _log.info("guide_store.stored device_os=%s title=%s", device_os, title)
     except Exception as exc:
         _log.warning("guide_store.store_failed error=%s", exc)
+
+
+def search_chain_patterns(device_os: str, n: int = 5) -> str:
+    """Return a formatted Markdown block of historical confirmed chains for
+    this device OS, ready to inject into the analyze LLM context.
+
+    Returns "" if no prior patterns exist or ChromaDB is unavailable.
+    """
+    col = _get_collection()
+    if col is None:
+        return ""
+    try:
+        where = {"device_os": {"$eq": device_os}} if device_os not in ("unknown", "") else None
+        kwargs: dict = {
+            "query_texts": [f"attack chain {device_os} security vulnerability"],
+            "n_results": n,
+        }
+        if where:
+            kwargs["where"] = where
+        results = col.query(**kwargs)
+        docs = results.get("documents", [[]])[0]
+        if not docs:
+            return ""
+
+        lines = [
+            f"## Historical Attack Patterns ({device_os} — {len(docs)} prior confirmed chain(s))",
+            "",
+            "These patterns were confirmed on similar devices in prior audit sessions.",
+            "Use them to recognise familiar attack paths faster — but still require raw_evidence.",
+            "",
+        ]
+        for doc in docs:
+            lines.append(f"- {doc}")
+        return "\n".join(lines)
+    except Exception as exc:
+        _log.warning("guide_store.search_failed error=%s", exc)
+        return ""

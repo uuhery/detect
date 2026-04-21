@@ -37,7 +37,7 @@ from switch_audit.tools.device_access import (
     load_methodology,
     probe_napalm,
 )
-from switch_audit.tools.guide_store import search_findings, store_finding
+from switch_audit.tools.guide_store import search_chain_patterns, store_chain_pattern
 from switch_audit.tools.nvd_enricher import enrich_with_nvd
 from switch_audit.tools.session_store import (
     build_resume_state,
@@ -87,8 +87,9 @@ def profiler(state: AuditState) -> dict:
     )
 
     device_os, device_vendor = classify_device_os(raw)
-    device_version = extract_version_string(raw, device_os)
-    napalm_ok = probe_napalm(state["target"], device_os)
+    napalm_ok, napalm_version = probe_napalm(state["target"], device_os)
+    # Prefer NAPALM's structured os_version; fall back to regex on raw text
+    device_version = napalm_version or extract_version_string(raw, device_os)
     access_method = "napalm" if napalm_ok else "ntc-templates"
 
     methodology = load_methodology()
@@ -99,7 +100,7 @@ def profiler(state: AuditState) -> dict:
         resume = build_resume_state(prior, methodology)
         extra = {
             "facts":            resume["facts"],
-            "attack_chains":    resume["chains"] if "chains" in resume else prior.get("chains", []),
+            "attack_chains":    resume["attack_chains"],
             "completed_checks": resume["completed_checks"],
             "pending_checks":   resume["pending_checks"],
         }
@@ -136,11 +137,11 @@ def profiler(state: AuditState) -> dict:
 # ---------------------------------------------------------------------------
 
 def search_memory(state: AuditState) -> dict:
-    """Search historical findings for this device OS (runs once per session).
+    """Search historical confirmed chain patterns for this device OS.
 
-    Idempotent: returns {} if enriched_strategy is already populated.
-    Populates enriched_strategy for the adviser node (used in Phase 2
-    when adviser becomes LLM-driven; no-op for Phase 1 sequential adviser).
+    Runs once per session (idempotent via enriched_strategy check).
+    Output is a formatted Markdown block injected into analyze's user message,
+    giving the LLM expert knowledge from prior audits of similar devices.
     """
     if state.get("enriched_strategy"):
         return {}
@@ -148,19 +149,14 @@ def search_memory(state: AuditState) -> dict:
     device_os = state.get("device_os", "unknown")
     logger.info("node.search_memory", device_os=device_os)
 
-    findings = search_findings(device_os, f"security audit {device_os}", n=5)
+    patterns = search_chain_patterns(device_os, n=5)
 
-    if not findings:
+    if not patterns:
         logger.info("node.search_memory.cold_start", device_os=device_os)
         return {"enriched_strategy": ""}
 
-    lines = [
-        f"[{f['meta'].get('severity', '?')}][{f['meta'].get('check_id', '?')}] {f['content']}"
-        for f in findings
-    ]
-    strategy = "\n".join(lines)
-    logger.info("node.search_memory.found", device_os=device_os, count=len(findings))
-    return {"enriched_strategy": strategy}
+    logger.info("node.search_memory.found", device_os=device_os)
+    return {"enriched_strategy": patterns}
 
 
 # ---------------------------------------------------------------------------
@@ -168,42 +164,12 @@ def search_memory(state: AuditState) -> dict:
 # ---------------------------------------------------------------------------
 
 def store_success(state: AuditState) -> dict:
-    """Store anonymised findings from the current trial into ChromaDB.
+    """Placeholder after analyze — ChromaDB storage happens at report time.
 
-    Stores:
-    - New Facts produced in this trial (low-severity defaults to 'medium')
-    - AttackChains that first became 'confirmed' in this trial
+    All confirmed chains are persisted in report() once the session is complete,
+    ensuring the stored pattern reflects the final confirmed state, not mid-session
+    partial information.
     """
-    device_os = state.get("device_os", "unknown")
-    current_trial = state["trial_count"] - 1  # executor already incremented
-
-    new_facts = [f for f in state.get("facts", []) if f["trial"] == current_trial]
-    for fact in new_facts:
-        store_finding(
-            device_os=device_os,
-            check_id=fact["source_check"],
-            content=fact["content"],
-            severity="medium",
-        )
-
-    new_confirmed_chains = [
-        c for c in state.get("attack_chains", [])
-        if c.get("confidence") == "confirmed" and c.get("trial_first_seen") == current_trial
-    ]
-    for chain in new_confirmed_chains:
-        store_finding(
-            device_os=device_os,
-            check_id="attack_chain",
-            content=f"{chain['title']}: {chain['attack_narrative']}",
-            severity=chain.get("severity", "medium"),
-        )
-
-    logger.info(
-        "node.store_success.done",
-        device_os=device_os,
-        facts_stored=len(new_facts),
-        chains_stored=len(new_confirmed_chains),
-    )
     return {}
 
 
@@ -314,15 +280,6 @@ def enrich(state: AuditState) -> dict:
     device_os = state.get("device_os", "")
     device_version = state.get("device_version", "")
 
-    # If profiler couldn't extract version from raw text, try NAPALM's parsed os_version
-    napalm_version_fallback = False
-    if not device_version:
-        for result in state.get("check_results", []):
-            if result["check_id"] == "device_identity" and result["access_method"] == "napalm":
-                device_version = result["data"].get("os_version", "")
-                napalm_version_fallback = bool(device_version)
-                break
-
     logger.info("node.enrich", device_os=device_os, device_version=device_version)
     ctx = enrich_with_nvd(device_os, device_version)
 
@@ -331,10 +288,7 @@ def enrich(state: AuditState) -> dict:
     else:
         logger.info("node.enrich.no_data", device_os=device_os, version=device_version)
 
-    result: dict = {"cve_context": ctx}
-    if napalm_version_fallback:
-        result["device_version"] = device_version  # backfill state so it's visible in report
-    return result
+    return {"cve_context": ctx}
 
 
 # ---------------------------------------------------------------------------
@@ -459,9 +413,15 @@ def _build_analyze_context(state: AuditState) -> str:
     # Live CVE context (injected once; enrich node sets this before first analyze call)
     cve_ctx = state.get("cve_context") or ""
 
-    sections = [latest_section, facts_section, chains_section, id_hint, pending_section]
+    # Historical attack patterns from prior audits of similar devices
+    historical_patterns = state.get("enriched_strategy", "")
+
+    sections = []
+    if historical_patterns:
+        sections.append(historical_patterns)
     if cve_ctx:
-        sections.insert(1, cve_ctx)  # right after the check data, before existing facts
+        sections.append(cve_ctx)
+    sections += [latest_section, facts_section, chains_section, id_hint, pending_section]
 
     return "\n\n".join(sections) + precomputed
 
@@ -824,6 +784,12 @@ def report(state: AuditState) -> dict:
                 f"| {entry['session_count']} session(s) | {status_marker} |"
             )
         lines = lines + [""] + tl_lines
+
+    # Store all confirmed chains as reusable patterns (final state, not per-trial)
+    confirmed_chains = [c for c in chains if c.get("confidence") == "confirmed"]
+    for chain in confirmed_chains:
+        store_chain_pattern(device_os=device_os, chain=chain)
+    logger.info("node.report.store_patterns", count=len(confirmed_chains))
 
     # Persist session for future resume
     save_session(

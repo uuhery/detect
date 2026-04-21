@@ -257,11 +257,17 @@ def extract_version_string(raw_show_version: str, device_os: str) -> str:
     return ""
 
 
-def probe_napalm(target: str, device_os: str) -> bool:
-    """Return True if a minimal NAPALM connection succeeds for this device."""
+def probe_napalm(target: str, device_os: str) -> tuple[bool, str]:
+    """Return (napalm_ok, os_version) from a minimal NAPALM connection.
+
+    Calls get_facts() to retrieve the structured os_version string, which is
+    more reliable than regex on raw show version output (especially for cEOS
+    where the version string has build suffixes).
+    Returns (False, "") if NAPALM is unavailable or connection fails.
+    """
     driver_name = _NAPALM_DRIVERS.get(device_os)
     if not driver_name:
-        return False
+        return False, ""
     try:
         from napalm import get_network_driver
         device = get_network_driver(driver_name)(
@@ -275,7 +281,11 @@ def probe_napalm(target: str, device_os: str) -> bool:
             },
         )
         device.open()
-        device.close()
-        return True
+        try:
+            facts = device.get_facts()
+            napalm_version = facts.get("os_version", "")
+        finally:
+            device.close()
+        return True, napalm_version
     except Exception:
-        return False
+        return False, ""
