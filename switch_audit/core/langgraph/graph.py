@@ -82,9 +82,16 @@ def build_graph() -> CompiledStateGraph:
     builder.add_node("store_success", store_success)
     builder.add_node("report", report)
 
+    # Checks whose results feed the discover node for lateral target extraction:
+    #   lldp_neighbors  → direct neighbor IPs
+    #   arp_table       → same-subnet active hosts
+    #   routing_table   → reachable subnets → candidate management IPs
+    #   running_config  → TACACS/BGP peer/NTP/GRE tunnel IPs
+    _DISCOVER_TRIGGERS = {"lldp_neighbors", "arp_table", "routing_table", "running_config"}
+
     def _route_to_discover(state: AuditState) -> str:
         results = state.get("check_results", [])
-        if results and results[-1]["check_id"] in ("lldp_neighbors", "arp_table"):
+        if results and results[-1]["check_id"] in _DISCOVER_TRIGGERS:
             return "discover"
         return "enrich"
 

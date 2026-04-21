@@ -75,15 +75,26 @@ def profiler(state: AuditState) -> dict:
 
     logger.info("node.profiler", target=state["target"])
 
-    raw = ssh_exec(
-        host=state["target"],
-        port=settings.SSH_PORT,
-        username=settings.SSH_USERNAME,
-        password=settings.SSH_PASSWORD,
-        command="show version",
-        timeout=settings.SSH_TIMEOUT,
-        device_type=settings.SSH_DEVICE_TYPE,
-    )
+    # Retry show version up to 3 times — devices may still be booting.
+    # Auth failures abort immediately; only timeouts are retried.
+    import time
+    raw = "[ssh_error] not started"
+    for attempt in range(3):
+        raw = ssh_exec(
+            host=state["target"],
+            port=settings.SSH_PORT,
+            username=settings.SSH_USERNAME,
+            password=settings.SSH_PASSWORD,
+            command="show version",
+            timeout=settings.SSH_TIMEOUT,
+            device_type=settings.SSH_DEVICE_TYPE,
+        )
+        if not raw.startswith("[ssh_error]"):
+            break
+        if "Authentication failed" in raw:
+            break
+        logger.warning("node.profiler.retry", attempt=attempt + 1, error=raw[:60])
+        time.sleep(5)
 
     device_os, device_vendor = classify_device_os(raw)
     napalm_ok, napalm_version = probe_napalm(state["target"], device_os)
@@ -241,17 +252,56 @@ def _is_routable(ip_str: str) -> bool:
         return False
 
 
-def _extract_lldp_ips(result: CheckResult) -> set[str]:
-    """Extract management IPs from LLDP CheckResult.
+# ---------------------------------------------------------------------------
+# Discovery helper types
+# ---------------------------------------------------------------------------
 
-    Handles two formats:
-    - NAPALM get_lldp_neighbors_detail: {"Eth0/1": [{"remote_management_address": "10.0.0.2", ...}]}
-    - ntc-templates: {"rows": [{"MANAGEMENT_ADDRESS": "10.0.0.2", ...}]}
-    """
+def _make_entry(ip: str, via: str | None, source: str, priority: str) -> dict:
+    return {"ip": ip, "via": via, "source": source, "priority": priority}
+
+
+# Regex patterns for running-config IP extraction
+_RE_TACACS   = re.compile(r"tacacs[+-]?server\s+(?:host\s+)?(\d{1,3}(?:\.\d{1,3}){3})", re.I)
+_RE_RADIUS   = re.compile(r"radius[+-]?server\s+(?:host\s+)?(\d{1,3}(?:\.\d{1,3}){3})", re.I)
+_RE_BGP_PEER = re.compile(r"neighbor\s+(\d{1,3}(?:\.\d{1,3}){3})\s+remote-as", re.I)
+_RE_NTP      = re.compile(r"ntp\s+server\s+(\d{1,3}(?:\.\d{1,3}){3})", re.I)
+_RE_TUNNEL   = re.compile(r"tunnel\s+destination\s+(\d{1,3}(?:\.\d{1,3}){3})", re.I)
+_RE_STATIC   = re.compile(r"ip\s+route\s+\S+\s+\S+\s+(\d{1,3}(?:\.\d{1,3}){3})", re.I)
+# Routing table: subnet prefixes (C/S/O/B/i lines)
+_RE_ROUTE_SUBNET = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})\b")
+# Management candidate offsets within a subnet (.1, .2, .254)
+_MGMT_OFFSETS = (1, 2, 254)
+
+
+def _is_routable(ip_str: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return not any(addr in net for net in _SKIP_NETS)
+    except ValueError:
+        return False
+
+
+def _subnet_candidates(net_str: str) -> list[str]:
+    """Return .1, .2, .254 of a subnet as candidate management IPs."""
+    try:
+        net = ipaddress.ip_network(net_str, strict=False)
+        if net.prefixlen >= 31:
+            return []
+        hosts = list(net.hosts())
+        candidates = []
+        for offset in _MGMT_OFFSETS:
+            idx = offset - 1
+            if idx < len(hosts):
+                candidates.append(str(hosts[idx]))
+        return candidates
+    except ValueError:
+        return []
+
+
+def _extract_lldp_ips(result: CheckResult, via: str) -> list[dict]:
     ips: set[str] = set()
     data = result.get("data", {})
 
-    # NAPALM format: dict of interface → list of neighbor dicts
     if isinstance(data, dict) and "rows" not in data and "raw" not in data:
         for neighbors in data.values():
             for nbr in (neighbors if isinstance(neighbors, list) else []):
@@ -260,74 +310,155 @@ def _extract_lldp_ips(result: CheckResult) -> set[str]:
                     if val and _is_routable(val):
                         ips.add(val)
 
-    # ntc-templates format
     for row in data.get("rows", []):
         for key in ("MANAGEMENT_ADDRESS", "MGMT_ADDRESS", "management_address"):
             val = row.get(key, "")
             if val and _is_routable(val):
                 ips.add(val)
 
-    return ips
+    return [_make_entry(ip, via, "lldp_neighbor", "high") for ip in sorted(ips)]
 
 
-def _extract_arp_ips(result: CheckResult) -> set[str]:
-    """Extract IPs from ARP CheckResult.
-
-    Handles two formats:
-    - NAPALM get_arp_table: [{"ip": "10.0.0.1", ...}]  (list, not dict)
-    - ntc-templates: {"rows": [{"PROTOCOL_ADDRESS": "10.0.0.1", ...}]}
-    """
+def _extract_arp_ips(result: CheckResult, via: str) -> list[dict]:
     ips: set[str] = set()
     data = result.get("data", {})
 
-    # NAPALM format: raw list
     if isinstance(data, list):
         for entry in data:
             val = entry.get("ip", "")
             if val and _is_routable(val):
                 ips.add(val)
 
-    # NAPALM wrapped as {"rows": [...]}
-    # ntc-templates format
     for row in data.get("rows", []):
         for key in ("PROTOCOL_ADDRESS", "IP_ADDRESS", "ip"):
             val = row.get(key, "")
             if val and _is_routable(val):
                 ips.add(val)
 
-    return ips
+    return [_make_entry(ip, via, "arp_entry", "low") for ip in sorted(ips)]
+
+
+def _extract_routing_ips(result: CheckResult, via: str) -> list[dict]:
+    """Extract candidate management IPs from routing table output.
+
+    For each discovered subnet, generates .1, .2, .254 as likely management
+    addresses. These are low-confidence targets — many will not be SSH devices.
+    """
+    raw = result.get("data", {}).get("raw", "")
+    if not raw:
+        return []
+
+    entries: list[dict] = []
+    seen_subnets: set[str] = set()
+    for m in _RE_ROUTE_SUBNET.finditer(raw):
+        net_str = f"{m.group(1)}/{m.group(2)}"
+        if net_str in seen_subnets:
+            continue
+        seen_subnets.add(net_str)
+        try:
+            net = ipaddress.ip_network(net_str, strict=False)
+            if net.is_loopback or net.is_link_local or net.is_multicast:
+                continue
+        except ValueError:
+            continue
+        for ip in _subnet_candidates(net_str):
+            if _is_routable(ip):
+                entries.append(_make_entry(ip, via, "routing_subnet", "low"))
+
+    return entries
+
+
+def _extract_config_ips(result: CheckResult, via: str) -> list[dict]:
+    """Extract high-value management server IPs from running-config.
+
+    Sources (priority order):
+      TACACS/RADIUS  → critical  (auth infrastructure — if compromised, all devices follow)
+      BGP peer       → high      (routing infrastructure)
+      NTP server     → medium    (time infrastructure)
+      GRE tunnel dst → medium    (tunnel endpoints = network pivots)
+      static routes  → low       (next-hop IPs)
+    """
+    data = result.get("data", {})
+    # NAPALM get_config returns {"running": "...", "startup": "...", "candidate": "..."}
+    raw = data.get("running") or data.get("raw", "")
+    if not raw:
+        return []
+
+    entries: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(ip: str, source: str, priority: str) -> None:
+        if ip not in seen and _is_routable(ip):
+            seen.add(ip)
+            entries.append(_make_entry(ip, via, source, priority))
+
+    for m in _RE_TACACS.finditer(raw):
+        _add(m.group(1), "tacacs_server", "critical")
+    for m in _RE_RADIUS.finditer(raw):
+        _add(m.group(1), "radius_server", "critical")
+    for m in _RE_BGP_PEER.finditer(raw):
+        _add(m.group(1), "bgp_peer", "high")
+    for m in _RE_NTP.finditer(raw):
+        _add(m.group(1), "ntp_server", "medium")
+    for m in _RE_TUNNEL.finditer(raw):
+        _add(m.group(1), "tunnel_endpoint", "medium")
+    for m in _RE_STATIC.finditer(raw):
+        _add(m.group(1), "static_route", "low")
+
+    return entries
+
+
+_PRIORITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 
 def discover(state: AuditState) -> dict:
-    """Extract neighbor IPs from LLDP/ARP CheckResult into discovery_queue.
+    """Extract lateral movement targets from LLDP/ARP/routing/config results.
 
-    Only runs when the latest check is lldp_neighbors or arp_table.
-    Maintains BFS invariant I1: discovery_queue ∩ visited_targets = ∅.
-    Results are sorted for deterministic ordering.
+    Each entry in discovery_queue carries:
+      ip       — target IP
+      via      — device through which this IP was discovered (for pivot)
+      source   — how it was found (lldp_neighbor / bgp_peer / routing_subnet / ...)
+      priority — critical > high > medium > low
+
+    BFS invariant I1: never enqueues IPs already in visited_targets.
     """
     results = state.get("check_results", [])
     if not results:
         return {}
     latest = results[-1]
+    check_id = latest["check_id"]
+    via = state["target"]  # discovered through the device currently being audited
 
-    if latest["check_id"] == "lldp_neighbors":
-        found = _extract_lldp_ips(latest)
-    elif latest["check_id"] == "arp_table":
-        found = _extract_arp_ips(latest)
+    if check_id == "lldp_neighbors":
+        candidates = _extract_lldp_ips(latest, via)
+    elif check_id == "arp_table":
+        candidates = _extract_arp_ips(latest, via)
+    elif check_id == "routing_table":
+        candidates = _extract_routing_ips(latest, via)
+    elif check_id == "running_config":
+        candidates = _extract_config_ips(latest, via)
     else:
-        return {}  # guard: conditional routing in graph should prevent this
+        return {}
 
     visited = set(state.get("visited_targets", [state["target"]]))
-    already_queued = set(state.get("discovery_queue", []))
-    fresh = sorted(ip for ip in found if ip not in visited and ip not in already_queued)
+    already_queued = {e["ip"] for e in state.get("discovery_queue", [])}
+
+    fresh = [
+        e for e in candidates
+        if e["ip"] not in visited and e["ip"] not in already_queued
+    ]
+    # Sort: priority first, then IP for determinism
+    fresh.sort(key=lambda e: (_PRIORITY_ORDER.get(e["priority"], 9), e["ip"]))
 
     if fresh:
         logger.info(
             "node.discover.found",
-            source=latest["check_id"],
+            source=check_id,
             count=len(fresh),
-            ips=fresh,
+            breakdown={s: sum(1 for e in fresh if e["source"] == s)
+                       for s in {e["source"] for e in fresh}},
         )
+
     return {
         "discovery_queue": state.get("discovery_queue", []) + fresh,
         "visited_targets": list(visited),

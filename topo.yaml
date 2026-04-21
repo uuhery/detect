@@ -6,7 +6,7 @@ mgmt:
 
 topology:
   nodes:
-    sw-target:
+    sw-a:
       kind: arista_ceos
       image: ceos:4.32.10M
       mgmt-ipv4: 172.20.20.2
@@ -16,5 +16,28 @@ topology:
            no shutdown
         management api http-commands
            no shutdown
+           protocol http
+        !
+        interface Ethernet1
+           no switchport
+           ip address 10.1.0.1/30
+        !
+        ip route 10.1.0.0/30 Ethernet1
       exec:
         - bash -c 'printf "configure\nmanagement api http-commands\nprotocol http\nno shutdown\n" | FastCli -p 15 -A'
+
+    sw-b:
+      kind: arista_ceos
+      image: ceos:4.32.10M
+      mgmt-ipv4: 172.20.20.3
+      startup-config: |
+        username admin privilege 15 role network-admin secret 0 admin
+        management ssh
+           no shutdown
+        !
+        interface Ethernet1
+           no switchport
+           ip address 10.1.0.2/30
+
+  links:
+    - endpoints: ["sw-a:eth1", "sw-b:eth1"]

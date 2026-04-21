@@ -14,9 +14,11 @@ The caller only needs execute_check(). Path selection is automatic.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Generator
 
 import yaml
 from ntc_templates.parse import parse_output
@@ -29,6 +31,33 @@ from switch_audit.tools import ssh_exec
 logging.getLogger("napalm").setLevel(logging.WARNING)
 logging.getLogger("netmiko").setLevel(logging.WARNING)
 logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+# ---------------------------------------------------------------------------
+# Pivot context — module-level socket used by all SSH calls in this session.
+# Set by main.py via pivot_context() before calling run_audit() on a pivoted target.
+# None = direct connection (default).
+# ---------------------------------------------------------------------------
+
+_pivot_sock: Any = None
+
+
+@contextmanager
+def pivot_context(sock: Any) -> Generator[None, None, None]:
+    """Temporarily route all SSH calls in this module through a Paramiko channel.
+
+    Usage in main.py:
+        channel = jump_client.get_transport().open_channel(
+            "direct-tcpip", (target_ip, 22), (jump_ip, 0)
+        )
+        with pivot_context(channel):
+            run_audit(target_ip, ...)
+    """
+    global _pivot_sock
+    _pivot_sock = sock
+    try:
+        yield
+    finally:
+        _pivot_sock = None
 
 _METHODOLOGY_PATH = Path(__file__).parent.parent / "knowledge" / "audit_methodology.yaml"
 
@@ -164,8 +193,9 @@ def execute_check(check_id: str, state: AuditState) -> CheckResult:
     access_method = state.get("access_method", "ssh-raw")
     cli_cmd = _resolve_cli(check, device_os)
 
-    # Layer 1: NAPALM — only when profiler confirmed it works for this device
-    if check.get("napalm_getter") and access_method == "napalm":
+    # Layer 1: NAPALM — only when profiler confirmed it works AND no pivot active.
+    # NAPALM creates its own TCP connection and cannot use a Paramiko tunnel channel.
+    if check.get("napalm_getter") and access_method == "napalm" and _pivot_sock is None:
         result = _try_napalm(check, state, device_os)
         if result:
             return result
@@ -284,6 +314,8 @@ def _ssh(state: AuditState, command: str) -> str:
         command=command,
         timeout=settings.SSH_TIMEOUT,
         device_type=settings.SSH_DEVICE_TYPE,
+        sock=_pivot_sock,
+        secret=settings.SSH_ENABLE_PASSWORD,
     )
 
 

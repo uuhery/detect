@@ -66,8 +66,15 @@ class Settings:
 
         # SSH — target device credentials
         self.SSH_PORT = int(os.getenv("SSH_PORT", "22"))
+        # SSH_NATIVE_PORT: real SSH port on network devices, used for pivot channels.
+        # When SSH_PORT is a local tunnel (e.g. 2222 → device:22), set this to 22.
+        self.SSH_NATIVE_PORT = int(os.getenv("SSH_NATIVE_PORT", str(self.SSH_PORT)))
         self.SSH_USERNAME = os.getenv("SSH_USERNAME", "admin")
         self.SSH_PASSWORD = os.getenv("SSH_PASSWORD", "admin")
+        # SSH_ENABLE_PASSWORD: enable/privileged-mode password sent after login.
+        # Defaults to SSH_PASSWORD. netmiko uses this to enter privileged mode when
+        # the device returns a non-privileged prompt (e.g. ">") after SSH login.
+        self.SSH_ENABLE_PASSWORD = os.getenv("SSH_ENABLE_PASSWORD", self.SSH_PASSWORD)
         self.SSH_TIMEOUT = int(os.getenv("SSH_TIMEOUT", "30"))
         # netmiko device_type: cisco_xe | cisco_ios | cisco_nxos | ...
         self.SSH_DEVICE_TYPE = os.getenv("SSH_DEVICE_TYPE", "cisco_xe")

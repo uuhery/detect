@@ -248,6 +248,21 @@ checks:
       default:        "show ntp status"
     security_relevance: Unauthenticated NTP allows time-spoofing attacks, corrupting log timestamps and certificate validity.
 
+  - id: routing_table
+    category: network_topology
+    description: IP routing table for subnet and next-hop discovery
+    napalm_getter: null
+    cli_fallback: "show ip route"
+    cli_by_os:
+      cisco_iosxe:    "show ip route"
+      cisco_ios:      "show ip route"
+      cisco_nxos:     "show ip route"
+      arista_eos:     "show ip route"
+      juniper_junos:  "show route"
+      frr:            "show ip route"
+      default:        "show ip route"
+    security_relevance: Reveals reachable subnets and next-hop gateways; primary source for lateral movement target discovery.
+
   - id: default_credentials
     category: access_auth
     description: Test known default and weak SSH credentials

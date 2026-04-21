@@ -2,12 +2,12 @@
 
 当前实现：
   ssh_exec — 通过 netmiko 在目标设备上执行单条命令，返回原始文本输出。
-             netmiko 自动处理 Cisco invoke_shell、分页、提示符检测。
-
-后续扩展：
-  send_raw_packet — 发送原始数据包（需要 scapy）
-  read_device_state — 读取并解析设备 MIB / REST API
+             支持 sock= 参数实现单跳 pivot（通过已连接设备的 Paramiko 隧道）。
 """
+
+from __future__ import annotations
+
+from typing import Any
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
@@ -21,15 +21,16 @@ def ssh_exec(
     command: str,
     timeout: int = 30,
     device_type: str = "cisco_xe",
+    sock: Any = None,
+    secret: str | None = None,
 ) -> str:
     """在网络设备上执行一条命令，返回输出文本（失败时返回错误描述）。
 
-    device_type 遵循 netmiko 命名约定：
-      cisco_xe   — IOS XE（Catalyst 8000、CSR1000V 等）
-      cisco_ios  — 经典 IOS
-      cisco_nxos — NX-OS
+    sock:   可选的 Paramiko Channel，用于单跳 pivot。
+    secret: enable/privileged 密码。设置后 netmiko 会在连接后自动发送 enable 命令，
+            确保所有命令在特权模式下执行。
     """
-    device = {
+    device: dict[str, Any] = {
         "device_type": device_type,
         "host": host,
         "port": port,
@@ -37,9 +38,13 @@ def ssh_exec(
         "password": password,
         "timeout": timeout,
         "conn_timeout": timeout,
-        "fast_cli": False,  # 关闭快速模式，提高稳定性
-        "use_keys": False,  # 空密码时禁止自动回退到密钥认证
+        "fast_cli": False,
+        "use_keys": False,
     }
+    if secret:
+        device["secret"] = secret
+    if sock is not None:
+        device["sock"] = sock
     try:
         with ConnectHandler(**device) as conn:
             output = conn.send_command(command)

@@ -117,7 +117,12 @@ class AuditState(TypedDict):
     enriched_strategy: str  # historical findings summary from ChromaDB; "" if cold start
 
     # ── Lateral discovery (discover writes, main.py reads) ──────────────────
-    discovery_queue: list[str]   # neighbor IPs found via LLDP/ARP; BFS queue source
+    # Each entry: {"ip": str, "via": str|None, "source": str, "priority": str}
+    #   via      — IP of the device through which this target was discovered (None = direct)
+    #   source   — "lldp_neighbor" | "arp_entry" | "routing_subnet" | "tacacs_server" |
+    #              "bgp_peer" | "ntp_server" | "tunnel_endpoint" | "static_route"
+    #   priority — "critical" | "high" | "medium" | "low"
+    discovery_queue: list[dict]  # neighbor targets; BFS queue source
     visited_targets: list[str]   # devices already audited; prevents BFS cycles (I1)
 
     # ── Control ─────────────────────────────────────────────────────────────

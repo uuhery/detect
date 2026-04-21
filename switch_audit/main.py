@@ -16,6 +16,7 @@ import re
 import socket
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +25,12 @@ from switch_audit.core.langgraph.graph import build_graph
 from switch_audit.core.logging import logger
 from switch_audit.tools import ssh_exec
 from switch_audit.tools.crypto import decode_type7
+from switch_audit.tools.device_access import pivot_context
+
+
+@contextmanager
+def _null_context():
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -134,13 +141,17 @@ def run_audit(
     session_id: str | None = None,
     credential_override: tuple[str, str] | None = None,
     visited_targets: set[str] | None = None,
+    pivot_sock=None,
 ) -> dict | None:
     """Run a full audit for one device.
 
-    Returns the final LangGraph result dict, or None if the device is
-    unreachable (TCP probe failed — avoids 30s SSH hang per device).
+    pivot_sock: optional Paramiko Channel for single-hop pivot.
+      When set, all SSH calls inside the graph tunnel through this channel.
+      Reachability probe is skipped — the pivot hop already confirmed connectivity.
+
+    Returns the final LangGraph result dict, or None if unreachable.
     """
-    if not _is_ssh_reachable(target, settings.SSH_PORT):
+    if pivot_sock is None and not _is_ssh_reachable(target, settings.SSH_PORT):
         logger.warning("run_audit.unreachable", target=target)
         return None
 
@@ -197,7 +208,9 @@ def run_audit(
 
     try:
         config = {"configurable": {"thread_id": session_id}}
-        result = graph.invoke(initial_state, config=config)
+        ctx = pivot_context(pivot_sock) if pivot_sock is not None else _null_context()
+        with ctx:
+            result = graph.invoke(initial_state, config=config)
     finally:
         if credential_override:
             settings.SSH_USERNAME = original_user
@@ -268,6 +281,38 @@ def _write_network_summary(
     logger.info("network_audit.summary_written", path=str(summary_path), devices=len(visited))
 
 
+def _open_pivot_channel(jump_ip: str, target_ip: str, target_port: int):
+    """Open a Paramiko direct-tcpip channel from jump_ip to target_ip.
+
+    Returns the channel, or None if the jump connection is unavailable.
+    The caller must NOT close the returned channel — it's owned by the
+    live_jumps transport and will be closed when that transport closes.
+    """
+    try:
+        import paramiko
+        jump = paramiko.SSHClient()
+        jump.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        jump.connect(
+            jump_ip,
+            port=settings.SSH_PORT,        # may be a local tunnel port (e.g. 2222)
+            username=settings.SSH_USERNAME,
+            password=settings.SSH_PASSWORD,
+            timeout=10,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        channel = jump.get_transport().open_channel(
+            "direct-tcpip",
+            (target_ip, target_port),      # target_port = SSH_NATIVE_PORT (22 on real devices)
+            (jump_ip, 0),
+        )
+        logger.info("pivot.channel_opened", jump=jump_ip, target=target_ip)
+        return jump, channel
+    except Exception as exc:
+        logger.warning("pivot.channel_failed", jump=jump_ip, target=target_ip, error=str(exc))
+        return None, None
+
+
 def run_network_audit(
     seeds: list[str],
     max_devices: int = 20,
@@ -279,29 +324,60 @@ def run_network_audit(
       I2: |visited| strictly +1 per iteration
       I3: |queue| ≤ |V| - |visited|, V finite → guaranteed termination
 
-    Credential propagation: creds found on device A are tried on device B
-    before falling back to the default credential table.
+    Pivot: when a queued entry has via=X and target is not directly reachable,
+    a Paramiko direct-tcpip channel is opened through X.
+    live_jumps keeps one SSHClient per jump host alive for the session duration.
     """
-    queue: deque[str] = deque(seeds)
+    # Seeds are always direct — convert to queue entry format
+    queue: deque[dict] = deque(
+        {"ip": ip, "via": None, "source": "seed", "priority": "high"}
+        for ip in seeds
+    )
     visited: set[str] = set()
     cred_pool: list[tuple[str, str]] = []
     all_reports: list[str] = []
-    # Maps "username" → [targets where this cred was reused from the pool]
     cred_reuse_map: dict[str, list[str]] = {}
+    # Persistent Paramiko connections used as pivot jump hosts
+    live_jumps: dict[str, object] = {}   # jump_ip → paramiko.SSHClient
 
     while queue and len(visited) < max_devices:
-        target = queue.popleft()
-        if target in visited:   # I1 guard (defensive; should not trigger)
+        entry = queue.popleft()
+        target = entry["ip"]
+        via    = entry.get("via")       # None = direct
+        source = entry.get("source", "?")
+        priority = entry.get("priority", "low")
+
+        if target in visited:   # I1 guard
             continue
 
         logger.info(
             "network_audit.start",
-            target=target,
-            audited=len(visited),
-            queued=len(queue),
+            target=target, via=via, source=source, priority=priority,
+            audited=len(visited), queued=len(queue),
         )
 
-        # Try pool creds before using configured defaults
+        # --- Pivot or direct connection ---
+        pivot_sock = None
+        jump_client = None
+
+        direct_reachable = _is_ssh_reachable(target, settings.SSH_PORT)
+
+        if not direct_reachable and via:
+            jump_client, pivot_sock = _open_pivot_channel(via, target, settings.SSH_NATIVE_PORT)
+            if pivot_sock is None:
+                logger.warning("network_audit.pivot_failed", target=target, via=via)
+                visited.add(target)   # mark so we don't retry
+                continue
+        elif not direct_reachable:
+            logger.warning("network_audit.unreachable_no_via", target=target)
+            visited.add(target)
+            continue
+
+        # Keep jump client alive for this session
+        if jump_client and via:
+            live_jumps.setdefault(via, jump_client)
+
+        # --- Credential selection ---
         working_cred = _find_working_credential(target, cred_pool)
         if working_cred:
             cred_reuse_map.setdefault(working_cred[0], []).append(target)
@@ -310,42 +386,46 @@ def run_network_audit(
             target,
             credential_override=working_cred,
             visited_targets=visited | {target},
+            pivot_sock=pivot_sock,
         )
-        visited.add(target)   # I2: always increment even on failure
+        visited.add(target)   # I2
 
         if result:
             if result.get("report_path"):
                 all_reports.append(result["report_path"])
 
-            # Propagate newly discovered credentials to pool
             new_creds = extract_propagatable_creds(result)
             for c in new_creds:
                 if c not in cred_pool:
                     cred_pool.append(c)
-                    logger.info(
-                        "network_audit.new_cred",
-                        source_target=target,
-                        username=c[0],
-                    )
+                    logger.info("network_audit.new_cred", source_target=target, username=c[0])
 
-            # BFS expansion: add LLDP/ARP discovered neighbors
-            for neighbor in result.get("discovery_queue", []):
-                if neighbor not in visited:
-                    queue.append(neighbor)
+            # BFS expansion — discovery_queue entries are now dicts
+            for entry in result.get("discovery_queue", []):
+                if isinstance(entry, dict):
+                    if entry["ip"] not in visited:
+                        queue.append(entry)
+                else:
+                    # fallback for plain string (shouldn't happen after this refactor)
+                    if entry not in visited:
+                        queue.append({"ip": entry, "via": None, "source": "legacy", "priority": "low"})
 
         logger.info(
             "network_audit.progress",
-            audited=len(visited),
-            queued=len(queue),
-            cred_pool_size=len(cred_pool),
+            audited=len(visited), queued=len(queue),
+            cred_pool_size=len(cred_pool), live_jumps=len(live_jumps),
         )
 
     if queue:
-        logger.warning(
-            "network_audit.truncated",
-            remaining=len(queue),
-            max_devices=max_devices,
-        )
+        logger.warning("network_audit.truncated", remaining=len(queue), max_devices=max_devices)
+
+    # Close all pivot connections
+    for jump_ip, client in live_jumps.items():
+        try:
+            client.close()
+            logger.info("pivot.connection_closed", jump=jump_ip)
+        except Exception:
+            pass
 
     _write_network_summary(all_reports, visited, cred_reuse_map)
 
