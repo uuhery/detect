@@ -618,13 +618,33 @@ def _precompute_decoded_passwords(text: str) -> str:
 def _build_analyze_context(state: AuditState) -> str:
     """Build the user message for analyze()'s LLM call.
 
+    Memory architecture — three layers, each with a distinct retention policy:
+
+    Episodic Memory (facts):
+      All extracted facts, complete and immutable, always fully visible.
+      Facts are already the compressed form of raw CLI output (~80 tokens each).
+      23 facts × 80 tokens ≈ 1840 tokens — no compression needed or wanted.
+      Hiding facts breaks cross-trial correlation; showing them all costs nothing.
+
+    Semantic Memory (chains):
+      Tiered by status — mirrors how a human analyst updates their working notes:
+        confirmed  → one-liner: closed hypothesis, evidence links preserved
+        active     → full detail: LLM still needs to reason about these
+        refuted    → dropped: no longer relevant to the analysis
+
+    Procedural Memory (pending checks):
+      What remains to be checked — lets LLM anchor speculative chains to future
+      evidence before that evidence exists (adviser picks check order, not LLM).
+
     Sections:
-      1. Latest CheckResult — check_id, access_method, confidence, security_relevance, data
-      2. Existing Facts summary (id + source_check + content)
-      3. Existing AttackChains summary (id + title + fact_ids + confidence)
-      4. ID hints (prevent LLM from hallucinating IDs)
-      5. Pending checks (for Rule 6 speculative chain anchoring)
-      6. Pre-decoded values (Type 7 passwords, algorithmic ground truth)
+      1. Historical patterns (Procedural Memory seed from ChromaDB)
+      2. CVE context (live NVD intelligence for this OS+version)
+      3. Latest CheckResult (the new evidence this trial)
+      4. Episodic Memory — all facts
+      5. Semantic Memory — all chains, tiered
+      6. ID hints (prevent hallucinated IDs)
+      7. Pending checks (Procedural Memory)
+      8. Pre-decoded values (algorithmic ground truth)
     """
     results = state.get("check_results", [])
     if not results:
@@ -649,82 +669,57 @@ def _build_analyze_context(state: AuditState) -> str:
         f"Collected data:\n```json\n{data_str}\n```"
     )
 
-    # --- Two-zone fact model: O(k) context, not O(n_total_facts) ---
-    # Hot zone: recent facts + facts referenced by open (unconfirmed) chains
-    # Archive zone: facts only in confirmed/refuted chains → single summary line
+    # --- Episodic Memory: all facts, always complete ---
+    # Design principle: facts are observations, not interpretations.
+    # They are immutable ground truth and must always be fully visible so the LLM
+    # can correlate any fact with any other, regardless of when they were collected.
     existing_facts = state.get("facts", [])
     existing_chains = state.get("attack_chains", [])
 
-    open_chain_fact_ids: set[str] = {
-        fid
-        for c in existing_chains
-        if c.get("confidence") not in ("confirmed", "refuted")
-        for fid in c.get("fact_ids", [])
-    }
-    recent_trials = {current_trial, current_trial - 1}
-
-    hot_facts = [
-        f for f in existing_facts
-        if f["id"] in open_chain_fact_ids or f.get("trial") in recent_trials
-    ]
-    cold_count = len(existing_facts) - len(hot_facts)
-
-    if hot_facts:
+    if existing_facts:
         facts_lines = [
-            f"  [{f['id']}] (check '{f['source_check']}', trial={f['trial']}): {f['content']}"
-            for f in hot_facts
+            f"  [{f['id']}] (check: {f['source_check']}, trial={f['trial']}): {f['content']}"
+            for f in existing_facts
         ]
         facts_section = (
-            "## Existing Facts (reference by id when building chains)\n"
+            f"## Episodic Memory — Facts ({len(existing_facts)} total, all visible)\n"
             + "\n".join(facts_lines)
         )
-        if cold_count:
-            facts_section += (
-                f"\n  ... {cold_count} more fact(s) in confirmed/refuted chains"
-                " (omitted — reference their IDs directly if needed)"
-            )
     else:
-        facts_section = "## Existing Facts\n  (none yet)"
-        if cold_count:
-            facts_section += f"\n  ({cold_count} fact(s) in confirmed/refuted chains — omitted)"
+        facts_section = "## Episodic Memory — Facts\n  (none yet)"
 
-    # --- Two-tier chain context ---
-    # Open chains (speculative/likely): full detail — LLM still needs to update them
-    # Confirmed chains: id/title/facts summary only (attack_narrative omitted)
-    # Refuted chains: omitted entirely
-    live_chains   = [c for c in existing_chains if c.get("confidence") not in ("confirmed", "refuted")]
-    closed_chains = [c for c in existing_chains if c.get("confidence") == "confirmed"]
+    # --- Semantic Memory: chains, tiered by status ---
+    # confirmed  → one-liner preserving fact_ids — closed, but evidence links stay queryable
+    # active     → full detail — LLM is still reasoning about these
+    # refuted    → dropped — no longer part of the working hypothesis space
+    confirmed_chains = [c for c in existing_chains if c.get("confidence") == "confirmed"]
+    active_chains    = [c for c in existing_chains if c.get("confidence") not in ("confirmed", "refuted")]
 
     chains_lines: list[str] = []
 
-    # Confirmed chains: title+severity only — they are closed; LLM must not reopen them.
-    # Auto-dedup (_find_overlapping_chain) prevents duplicate chain creation.
-    if closed_chains:
-        closed_summary = ", ".join(
-            f"\"{c['title']}\" [{c['severity']}]" for c in closed_chains
-        )
+    for c in confirmed_chains:
         chains_lines.append(
-            f"  Confirmed ({len(closed_chains)}): {closed_summary}"
+            f"  ✓ [{c['id']}] \"{c['title']}\" | {c['severity']} | "
+            f"facts={c['fact_ids']}  ← confirmed, do not reopen"
         )
 
-    # Open chains: full detail — LLM still needs to update confidence / add facts.
-    for c in live_chains:
+    for c in active_chains:
         chains_lines.append(
-            f"  [{c['id']}] \"{c['title']}\" | facts={c['fact_ids']} | "
+            f"  ? [{c['id']}] \"{c['title']}\" | facts={c['fact_ids']} | "
             f"severity={c['severity']} | confidence={c['confidence']} | "
             f"verify={c.get('verification_needed', [])}"
         )
 
     if chains_lines:
         chains_section = (
-            "## Existing AttackChains "
-            "(set existing_chain_id to update, or null to create new)\n"
+            "## Semantic Memory — Attack Chains "
+            "(existing_chain_id to update, null to create new)\n"
             + "\n".join(chains_lines)
         )
     else:
-        chains_section = "## Existing AttackChains\n  (none yet)"
+        chains_section = "## Semantic Memory — Attack Chains\n  (none yet)"
 
-    # ID hints — count all facts in current trial (not just hot ones)
+    # ID hints — prevent LLM from hallucinating IDs that conflict with existing ones
     facts_this_trial = sum(1 for f in existing_facts if f.get("trial") == current_trial)
     id_hint = (
         f"## ID Hints\n"
@@ -733,24 +728,24 @@ def _build_analyze_context(state: AuditState) -> str:
         f"  New Chain IDs (existing_chain_id=null only): c{current_trial}-{{index}}"
     )
 
-    # Pending checks (for speculative chain anchoring)
+    # Procedural Memory: pending checks — lets LLM anticipate future evidence
     pending = state.get("pending_checks", [])
     if pending:
         pending_section = (
-            "## Pending checks (not yet executed — use check_ids in verification_needed)\n"
-            "You may anchor speculative chains to these, but do NOT create Facts from them.\n"
+            "## Procedural Memory — Pending Checks "
+            "(not yet executed — use in verification_needed to anchor speculative chains)\n"
             + "\n".join(f"  - {cid}" for cid in pending)
         )
     else:
-        pending_section = "## Pending checks\n  (all checks completed)"
+        pending_section = "## Procedural Memory — Pending Checks\n  (all checks completed)"
 
-    # Precomputed Type 7 passwords
+    # Precomputed Type 7 passwords (algorithmic ground truth, injected verbatim)
     precomputed = _precompute_decoded_passwords(_extract_text_for_precompute(latest))
 
-    # Live CVE context (injected once; enrich node sets this before first analyze call)
+    # Live CVE context (injected once by enrich node)
     cve_ctx = state.get("cve_context") or ""
 
-    # Historical attack patterns from prior audits of similar devices
+    # Historical chain patterns from prior audits of similar devices (ChromaDB)
     historical_patterns = state.get("enriched_strategy", "")
 
     sections = []

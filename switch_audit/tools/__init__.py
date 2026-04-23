@@ -47,6 +47,8 @@ def ssh_exec(
         device["sock"] = sock
     try:
         with ConnectHandler(**device) as conn:
+            if secret and not conn.check_enable_mode():
+                conn.enable()
             output = conn.send_command(command)
         return output.strip() if output.strip() else "(empty output)"
     except NetmikoAuthenticationException:
